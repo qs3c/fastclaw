@@ -47,7 +47,11 @@ func (f *forcedFinalRetryProvider) ChatStream(_ context.Context, messages []prov
 		return nil, errors.New("too many tokens")
 	}
 	ch := make(chan provider.StreamChunk, 1)
-	ch <- provider.StreamChunk{Content: "FORCED_FINAL_OK", Done: true}
+	content := "FORCED_FINAL_OK"
+	if strings.Contains(messagesText(messages), planModeNudge()) {
+		content = "PLAN_MODE_OK"
+	}
+	ch <- provider.StreamChunk{Content: content, Done: true}
 	close(ch)
 	return provider.NewStreamReader(ch), nil
 }
@@ -137,6 +141,62 @@ func TestForcedFinalDeliveryUsesEmergencyRetryAndKeepsCapNudgeRequestOnly(t *tes
 	}
 	if strings.Contains(messagesText(sess.GetMessages()), "You've used all 0 tool-call iterations") {
 		t.Fatalf("session messages included request-only cap nudge:\n%s", messagesText(sess.GetMessages()))
+	}
+}
+
+func TestPlanModeUsesEmergencyRetryWithToolsDisabled(t *testing.T) {
+	home := t.TempDir()
+	sessions := session.NewManager(t.TempDir())
+	msg := bus.InboundMessage{
+		Text:      "draft a plan",
+		Channel:   "web",
+		AccountID: "acct-1",
+		ChatID:    "chat-plan",
+		UserID:    "owner-1",
+		Params:    map[string]any{"planMode": true},
+	}
+	sess := sessions.Get(msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
+	for i := 0; i < 12; i++ {
+		sess.Append(provider.Message{Role: "user", Content: strings.Repeat("old plan user ", 20), Origin: provider.OriginUser})
+		sess.Append(provider.Message{Role: "assistant", Content: strings.Repeat("old plan assistant ", 20), Origin: provider.OriginUser})
+	}
+
+	prov := &forcedFinalRetryProvider{}
+	mem := NewMemory(home)
+	a := &Agent{
+		name:              "agent-test",
+		provider:          prov,
+		registry:          tools.NewRegistry(home, home),
+		sessions:          sessions,
+		memory:            mem,
+		ctxBuilder:        NewContextBuilder(home, mem, ""),
+		hooks:             NewHookRegistry(),
+		model:             "fake-model",
+		maxTokens:         20,
+		maxToolIterations: 4,
+		contextWindow:     120,
+		homePath:          home,
+		homeDir:           home,
+		ownerUserID:       "owner-1",
+	}
+
+	reply := a.HandleMessage(context.Background(), msg)
+
+	if !strings.Contains(reply, "PLAN_MODE_OK") {
+		t.Fatalf("reply = %q, want plan-mode retry content", reply)
+	}
+	if prov.streamCalls != 2 {
+		t.Fatalf("streamCalls = %d, want 2", prov.streamCalls)
+	}
+	if len(prov.tools) != 2 || len(prov.tools[0]) != 0 || len(prov.tools[1]) != 0 {
+		t.Fatalf("plan-mode tools = %+v, want tools disabled on both attempts", prov.tools)
+	}
+	retryText := messagesText(prov.requests[1])
+	if !strings.Contains(retryText, "[Reactive Context Summary]") {
+		t.Fatalf("retry request missing reactive summary:\n%s", retryText)
+	}
+	if !strings.Contains(retryText, planModeNudge()) {
+		t.Fatalf("retry request missing plan-mode nudge:\n%s", retryText)
 	}
 }
 

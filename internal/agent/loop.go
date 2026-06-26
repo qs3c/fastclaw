@@ -748,23 +748,28 @@ func (a *Agent) streamChatToResponseQuiet(ctx context.Context, messages []provid
 	return a.streamChatToResponseWithOptions(ctx, messages, tools, false)
 }
 
-func (a *Agent) compactionOptions(mode CompactMode, overhead []provider.Message, toolDefs []provider.Tool, sessionKey string) CompactOptions {
+func (a *Agent) compactionOptions(mode CompactMode, overhead []provider.Message, toolDefs []provider.Tool, sessionKey string, buildRequest ...modelRequestBuildFunc) CompactOptions {
 	_ = sessionKey
 	contextWindow := a.contextWindow
 	if contextWindow <= 0 {
 		contextWindow = DefaultContextWindow
 	}
+	var buildRequestMessages func([]provider.Message) []provider.Message
+	if len(buildRequest) > 0 {
+		buildRequestMessages = buildRequest[0]
+	}
 	return CompactOptions{
-		Mode:              mode,
-		Workspace:         a.homePath,
-		Provider:          a.provider,
-		Model:             a.model,
-		ContextWindow:     contextWindow,
-		MaxOutputTokens:   a.maxTokens,
-		OverheadMessages:  overhead,
-		ToolDefs:          toolDefs,
-		MinTailTurns:      MinimumTailTurns,
-		SummaryMaxRetries: DefaultSummaryMaxRetries,
+		Mode:                 mode,
+		Workspace:            a.homePath,
+		Provider:             a.provider,
+		Model:                a.model,
+		ContextWindow:        contextWindow,
+		MaxOutputTokens:      a.maxTokens,
+		OverheadMessages:     overhead,
+		ToolDefs:             toolDefs,
+		BuildRequestMessages: buildRequestMessages,
+		MinTailTurns:         MinimumTailTurns,
+		SummaryMaxRetries:    DefaultSummaryMaxRetries,
 	}
 }
 
@@ -827,7 +832,7 @@ func (a *Agent) callLLMWithEmergencyRetry(
 		return resp, messages, false, err
 	}
 
-	result, compactErr := a.compactWithProgress(ctx, sess.GetMessages(), a.compactionOptions(CompactModeEmergency, overhead, toolDefs, sess.SessionKey()))
+	result, compactErr := a.compactWithProgress(ctx, sess.GetMessages(), a.compactionOptions(CompactModeEmergency, overhead, toolDefs, sess.SessionKey(), buildRequest))
 	if compactErr != nil {
 		slog.Warn("emergency compaction failed", "agent", a.name, "error", compactErr)
 		return resp, messages, false, err
@@ -1843,19 +1848,41 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 	// work for the execution turn.
 	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
 	catalog := buildToolCatalogForPlan(toolDefs)
-	messages := []provider.Message{
+	overheadMessages := []provider.Message{
 		{Role: "system", Content: systemPrompt},
 		{Role: "system", Content: planModeNudge()},
 	}
 	if catalog != "" {
-		messages = append(messages, provider.Message{Role: "system", Content: catalog})
+		overheadMessages = append(overheadMessages, provider.Message{Role: "system", Content: catalog})
 	}
-	messages = append(messages, a.withMessageTimestampsForChatter(sess.GetMessages(), chatterUID)...)
-	if a.piiScrubEnabled {
-		messages = privacy.ScrubMessages(messages)
+	buildRequest := func(sessionMessages []provider.Message) []provider.Message {
+		return compactionRequestMessages(a.withMessageTimestampsForChatter(sessionMessages, chatterUID), overheadMessages)
+	}
+	prepareModelRequest := func(request []provider.Message) []provider.Message {
+		if a.piiScrubEnabled {
+			return privacy.ScrubMessages(request)
+		}
+		return request
 	}
 
-	resp, err := a.streamChatToResponse(ctx, messages, nil)
+	sessionMsgs := sess.GetMessages()
+	compactResult, err := a.compactWithProgress(ctx, sessionMsgs, a.compactionOptions(CompactModeProactive, overheadMessages, nil, sess.SessionKey(), buildRequest))
+	if err != nil {
+		slog.Warn("plan-mode compaction error", "agent", a.name, "error", err)
+	}
+	if compactResult != nil && compactResult.Pruned {
+		sess.ReplaceMessages(compactResult.Messages)
+		sessionMsgs = compactResult.Messages
+		slog.Info("plan-mode context compacted", "agent", a.name, "log_file", compactResult.LogFile)
+	}
+
+	messages := buildRequest(sessionMsgs)
+	resp, updatedMessages, didRetry, err := a.callLLMWithEmergencyRetry(ctx, sess, overheadMessages, nil, messages, nil, false, buildRequest, prepareModelRequest, func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
+		return a.streamChatToResponse(ctx, request, tools)
+	})
+	if didRetry {
+		messages = updatedMessages
+	}
 	if err != nil {
 		slog.Error("plan-mode chat failed", "agent", a.name, "error", err)
 		emitEvent(ctx, ChatEvent{Type: "error", Data: map[string]any{"message": err.Error()}})
@@ -2115,9 +2142,12 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 
 	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
 	overheadMessages := a.buildRequestOverhead(systemPrompt, msg, chatterMem)
+	buildRequest := func(sessionMessages []provider.Message) []provider.Message {
+		return compactionRequestMessages(a.withMessageTimestampsForChatter(sessionMessages, chatterUID), overheadMessages)
+	}
 
 	sessionMsgs := sess.GetMessages()
-	compactResult, err := a.compactWithProgress(ctx, sessionMsgs, a.compactionOptions(CompactModeProactive, overheadMessages, toolDefs, sess.SessionKey()))
+	compactResult, err := a.compactWithProgress(ctx, sessionMsgs, a.compactionOptions(CompactModeProactive, overheadMessages, toolDefs, sess.SessionKey(), buildRequest))
 	if err != nil {
 		slog.Warn("compaction error", "agent", a.name, "error", err)
 	}
@@ -2128,9 +2158,6 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		slog.Info("context compacted", "agent", a.name, "log_file", compactResult.LogFile)
 	}
 
-	buildRequest := func(sessionMessages []provider.Message) []provider.Message {
-		return compactionRequestMessages(a.withMessageTimestampsForChatter(sessionMessages, chatterUID), overheadMessages)
-	}
 	messages := buildRequest(sessionMsgs)
 	prepareModelRequest := func(request []provider.Message) []provider.Message {
 		if a.piiScrubEnabled {
@@ -2250,15 +2277,8 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			// Fold it in and keep going instead of returning, so the
 			// user's mid-flight instruction isn't deferred to a new turn.
 			if steer := sess.DrainSteer(); len(steer) > 0 {
-				// Carry the just-produced answer into the next LLM call
-				// only when it has text. A no-text, no-tool-call
-				// assistant message is an invalid turn for Anthropic
-				// (an assistant turn needs a non-empty content block),
-				// and this is the only path that would re-send one.
-				if resp.Content != "" {
-					messages = append(messages, asst)
-				}
 				messages = a.appendSteer(ctx, sess, messages, steer)
+				messages = buildRequest(sess.GetMessages())
 				continue
 			}
 			emitEvent(ctx, ChatEvent{Type: "done"})
@@ -2500,6 +2520,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		// and can change course.
 		if steer := sess.DrainSteer(); len(steer) > 0 {
 			messages = a.appendSteer(ctx, sess, messages, steer)
+			messages = buildRequest(sess.GetMessages())
 		}
 	}
 

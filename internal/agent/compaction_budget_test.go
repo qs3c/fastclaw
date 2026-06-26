@@ -132,3 +132,47 @@ func TestProactiveCompactionIncludesRequestOverheadAndToolDefs(t *testing.T) {
 		t.Fatalf("message count = %d, want less than %d", len(res.Messages), len(msgs))
 	}
 }
+
+func TestProactiveCompactionUsesBuildRequestMessagesForBudget(t *testing.T) {
+	var msgs []provider.Message
+	for i := 0; i < 12; i++ {
+		msgs = append(msgs,
+			provider.Message{Role: "user", Content: "short user", Origin: provider.OriginUser},
+			provider.Message{Role: "assistant", Content: "short assistant", Origin: provider.OriginUser},
+		)
+	}
+	opts := normalizeCompactOptions(CompactOptions{
+		Mode:            CompactModeProactive,
+		ContextWindow:   1200,
+		MaxOutputTokens: 400,
+		TriggerPercent:  75,
+	})
+	if raw := EstimateRequestTokens(compactionRequestMessages(msgs, nil), nil); raw >= compactTriggerLimit(opts) {
+		t.Fatalf("raw fixture tokens = %d, want below trigger %d", raw, compactTriggerLimit(opts))
+	}
+
+	f := &countingSummarizer{}
+	res, err := CompactMessagesWithOptions(msgs, CompactOptions{
+		Mode:            CompactModeProactive,
+		Provider:        f,
+		Model:           "fake-model",
+		ContextWindow:   1200,
+		MaxOutputTokens: 400,
+		TriggerPercent:  75,
+		TargetPercent:   55,
+		BuildRequestMessages: func(sessionMessages []provider.Message) []provider.Message {
+			expanded := append([]provider.Message(nil), sessionMessages...)
+			expanded = append(expanded, provider.Message{Role: "system", Content: strings.Repeat("expanded timestamp ", 200)})
+			return expanded
+		},
+	})
+	if err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if f.calls != 1 {
+		t.Fatalf("summary calls = %d, want 1", f.calls)
+	}
+	if !res.Pruned {
+		t.Fatal("expected request builder expansion to trigger compaction")
+	}
+}

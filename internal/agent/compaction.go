@@ -45,23 +45,24 @@ const (
 )
 
 type CompactOptions struct {
-	Mode               CompactMode
-	Workspace          string
-	Provider           provider.Provider
-	Model              string
-	ContextWindow      int
-	MaxOutputTokens    int
-	TriggerPercent     int
-	TargetPercent      int
-	TailTargetPercent  int
-	TailTargetMessages int
-	MinTailTurns       int
-	Focus              string
-	OverheadMessages   []provider.Message
-	ToolDefs           []provider.Tool
-	SummaryMaxRetries  int
-	Ctx                context.Context
-	OnTriggered        func()
+	Mode                 CompactMode
+	Workspace            string
+	Provider             provider.Provider
+	Model                string
+	ContextWindow        int
+	MaxOutputTokens      int
+	TriggerPercent       int
+	TargetPercent        int
+	TailTargetPercent    int
+	TailTargetMessages   int
+	MinTailTurns         int
+	Focus                string
+	OverheadMessages     []provider.Message
+	ToolDefs             []provider.Tool
+	BuildRequestMessages func([]provider.Message) []provider.Message
+	SummaryMaxRetries    int
+	Ctx                  context.Context
+	OnTriggered          func()
 }
 
 // EstimateTokens provides a rough token estimate: chars/4.
@@ -120,7 +121,7 @@ func CompactMessages(messages []provider.Message, workspace string, prov provide
 
 func CompactMessagesWithOptions(messages []provider.Message, opts CompactOptions) (*CompactResult, error) {
 	opts = normalizeCompactOptions(opts)
-	tokens := EstimateRequestTokens(compactionRequestMessages(messages, opts.OverheadMessages), opts.ToolDefs)
+	tokens := compactRequestTokens(messages, opts)
 
 	switch opts.Mode {
 	case CompactModeManual:
@@ -214,6 +215,14 @@ func compactionRequestMessages(messages, overhead []provider.Message) []provider
 	return request
 }
 
+func compactRequestTokens(messages []provider.Message, opts CompactOptions) int {
+	request := compactionRequestMessages(messages, opts.OverheadMessages)
+	if opts.BuildRequestMessages != nil {
+		request = opts.BuildRequestMessages(messages)
+	}
+	return EstimateRequestTokens(request, opts.ToolDefs)
+}
+
 func emergencyCompactMessages(messages []provider.Message, opts CompactOptions, beforeTokens int) *CompactResult {
 	opts.Mode = CompactModeEmergency
 	slog.Info(
@@ -249,7 +258,7 @@ func emergencyCompactMessages(messages []provider.Message, opts CompactOptions, 
 
 	slog.Info(
 		"after emergency compression",
-		"tokens_after", EstimateRequestTokens(compactionRequestMessages(compressed, opts.OverheadMessages), opts.ToolDefs),
+		"tokens_after", compactRequestTokens(compressed, opts),
 		"tail_target_percent", opts.TailTargetPercent,
 	)
 	return &CompactResult{
@@ -288,7 +297,7 @@ func compactMessagesTriggered(messages []provider.Message, opts CompactOptions, 
 	sanitized, sanitizedChanged := sanitizeToolPairsWithChange(messages)
 	pruned, prunedChanged := pruneOldToolResultsWithChange(sanitized, opts)
 	changed := sanitizedChanged || prunedChanged
-	prunedTokens := EstimateRequestTokens(compactionRequestMessages(pruned, opts.OverheadMessages), opts.ToolDefs)
+	prunedTokens := compactRequestTokens(pruned, opts)
 
 	slog.Info("after pruning", "tokens_before", tokens, "tokens_after", prunedTokens)
 
@@ -323,7 +332,7 @@ func compactMessagesTriggered(messages []provider.Message, opts CompactOptions, 
 	slog.Info(
 		"after compression",
 		"tokens_before", prunedTokens,
-		"tokens_after", EstimateRequestTokens(compactionRequestMessages(compressed, opts.OverheadMessages), opts.ToolDefs),
+		"tokens_after", compactRequestTokens(compressed, opts),
 	)
 
 	return &CompactResult{
