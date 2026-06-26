@@ -790,16 +790,16 @@ func (a *Agent) callLLMWithEmergencyRetry(
 ) (*provider.Response, []provider.Message, bool, error) {
 	resp, err := call(messages, callTools)
 	if err == nil || alreadyRetried || !isContextLimitError(err) {
-		return resp, messages, alreadyRetried, err
+		return resp, messages, false, err
 	}
 
 	result, compactErr := a.compactWithProgress(ctx, sess.GetMessages(), a.compactionOptions(CompactModeEmergency, overhead, toolDefs, sess.SessionKey()))
 	if compactErr != nil {
 		slog.Warn("emergency compaction failed", "agent", a.name, "error", compactErr)
-		return resp, messages, alreadyRetried, err
+		return resp, messages, false, err
 	}
 	if result == nil || !result.Pruned {
-		return resp, messages, alreadyRetried, err
+		return resp, messages, false, err
 	}
 
 	sess.ReplaceMessages(result.Messages)
@@ -2074,9 +2074,11 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	userMsg := buildUserMessage(msg)
 	sess.Append(userMsg)
 
-	// Context compaction: check if session messages are too large
+	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
+	overheadMessages := a.buildRequestOverhead(systemPrompt, msg, chatterMem)
+
 	sessionMsgs := sess.GetMessages()
-	compactResult, err := CompactMessages(sessionMsgs, a.homePath, a.provider, a.model)
+	compactResult, err := a.compactWithProgress(ctx, sessionMsgs, a.compactionOptions(CompactModeProactive, overheadMessages, toolDefs, sess.SessionKey()))
 	if err != nil {
 		slog.Warn("compaction error", "agent", a.name, "error", err)
 	}
@@ -2087,29 +2089,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		slog.Info("context compacted", "agent", a.name, "log_file", compactResult.LogFile)
 	}
 
-	messages := make([]provider.Message, 0, len(sessionMsgs)+4)
-	messages = append(messages, provider.Message{Role: "system", Content: systemPrompt})
-	if hints := renderChannelHints(msg, a.splitReplies); hints != "" {
-		messages = append(messages, provider.Message{Role: "system", Content: hints})
-	}
-	if senderMsg := renderSender(msg); senderMsg != "" {
-		messages = append(messages, provider.Message{Role: "system", Content: senderMsg})
-	}
-	if paramsMsg := renderClientParams(msg.Params); paramsMsg != "" {
-		messages = append(messages, provider.Message{Role: "system", Content: paramsMsg})
-	}
-	// Persistence reminder — chatbot-only, positioned just before the
-	// session history so recency weight outranks the model's training
-	// prior of "I have no cross-session memory". See
-	// renderChatbotPersistenceReminder for why this isn't enough to put
-	// in the main system prompt alone.
-	if reminder := renderChatbotPersistenceReminder(a.promptMode, a.displayName, chatterMem.LoadUserFile(), chatterMem.LoadMemory()); reminder != "" {
-		messages = append(messages, provider.Message{Role: "system", Content: reminder})
-	}
-	messages = append(messages, a.withMessageTimestampsForChatter(sessionMsgs, chatterUID)...)
-
-	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
-
+	messages := compactionRequestMessages(a.withMessageTimestampsForChatter(sessionMsgs, chatterUID), overheadMessages)
 	// Loop detection: track consecutive identical tool calls
 	type toolCallSig struct {
 		name string
@@ -2136,6 +2116,8 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// channels.SplitMessageMarker at return time; manager.dispatchOutbound
 	// splits on it (AllowSplit=true) or collapses to newlines otherwise.
 	var replyParts []string
+
+	emergencyRetried := false
 
 	// ReAct loop
 	for i := 0; i < a.maxToolIterations; i++ {
@@ -2181,10 +2163,17 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				),
 			})
 		}
-		dumpLLMRequest(a.name, a.model, llmMessages, callTools)
-		resp, err := llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
-			return a.streamChatToResponse(ctx, llmMessages, callTools)
+		resp, updatedMessages, didRetry, err := a.callLLMWithEmergencyRetry(ctx, sess, overheadMessages, toolDefs, llmMessages, callTools, emergencyRetried, func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
+			dumpLLMRequest(a.name, a.model, request, tools)
+			return llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
+				return a.streamChatToResponse(ctx, request, tools)
+			})
 		})
+		if didRetry {
+			emergencyRetried = true
+			messages = updatedMessages
+			llmMessages = updatedMessages
+		}
 
 		// Hook: AfterModelCall
 		hcAfter := &HookContext{AgentName: a.name, Point: AfterModelCall, Messages: messages, Response: resp, Error: err, StartTime: hcBefore.StartTime, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID, GoalSessionKey: a.registry.GoalSessionKey()}
