@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
+	"github.com/fastclaw-ai/fastclaw/internal/config"
 )
 
 // slashResult holds the result of a slash command.
@@ -24,7 +26,7 @@ type slashResult struct {
 }
 
 // handleSlashCommand checks if the message is a slash command and handles it.
-func (a *Agent) handleSlashCommand(msg bus.InboundMessage) slashResult {
+func (a *Agent) handleSlashCommand(ctx context.Context, msg bus.InboundMessage) slashResult {
 	text := strings.TrimSpace(msg.Text)
 	if !strings.HasPrefix(text, "/") {
 		return slashResult{}
@@ -87,7 +89,7 @@ func (a *Agent) handleSlashCommand(msg bus.InboundMessage) slashResult {
 		return a.slashUndo(msg)
 
 	case "/compact":
-		return a.slashCompact(msg)
+		return a.slashCompact(ctx, msg, strings.Join(args, " "))
 
 	case "/status":
 		return a.slashStatus(msg)
@@ -265,7 +267,7 @@ func (a *Agent) slashUndo(msg bus.InboundMessage) slashResult {
 	return slashResult{handled: true, reply: "Nothing to undo."}
 }
 
-func (a *Agent) slashCompact(msg bus.InboundMessage) slashResult {
+func (a *Agent) slashCompact(ctx context.Context, msg bus.InboundMessage, focus string) slashResult {
 	sess := a.sessions.Get(msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
 	sessionMsgs := sess.GetMessages()
 
@@ -273,15 +275,20 @@ func (a *Agent) slashCompact(msg bus.InboundMessage) slashResult {
 		return slashResult{handled: true, reply: "No messages to compact."}
 	}
 
-	result, err := CompactMessages(sessionMsgs, a.homePath, a.provider, a.model)
+	opts := a.compactionOptions(CompactModeManual, nil, nil, sess.SessionKey())
+	opts.Focus = focus
+	if a.registry != nil {
+		opts.ToolDefs = a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
+	}
+	result, err := a.compactWithProgress(ctx, sessionMsgs, opts)
 	if err != nil {
 		return slashResult{handled: true, reply: fmt.Sprintf("Compaction error: %v", err)}
 	}
 	if result != nil && result.Pruned {
 		sess.ReplaceMessages(result.Messages)
-		return slashResult{handled: true, reply: fmt.Sprintf("✅ Compacted: %d → %d messages.", len(sessionMsgs), len(result.Messages))}
+		return slashResult{handled: true, reply: fmt.Sprintf("Compacted checkpoint: %d -> %d messages.", len(sessionMsgs), len(result.Messages))}
 	}
-	return slashResult{handled: true, reply: "Session is within limits, no compaction needed."}
+	return slashResult{handled: true, reply: "Nothing to compact."}
 }
 
 func (a *Agent) slashStatus(msg bus.InboundMessage) slashResult {
@@ -437,6 +444,7 @@ func (a *Agent) slashPersonalitySet(msg bus.InboundMessage, name string) slashRe
 func (a *Agent) slashModel(msg bus.InboundMessage, model string) slashResult {
 	old := a.model
 	a.model = model
+	a.contextWindow = config.ResolveContextWindow(a.providerConfigs, a.model, a.maxTokens)
 	return slashResult{handled: true, reply: fmt.Sprintf("🤖 Model switched: `%s` → `%s`", old, model)}
 }
 

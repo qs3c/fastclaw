@@ -44,6 +44,7 @@ type Agent struct {
 	model                string
 	maxTokens            int
 	contextWindow        int
+	providerConfigs      map[string]config.ProviderConfig
 	temperature          float64
 	maxToolIterations    int
 	maxParallelToolCalls int // 0 = unlimited
@@ -219,6 +220,17 @@ func NewAgent(rc config.ResolvedAgent, prov provider.Provider, mb *bus.MessageBu
 	return NewAgentWithSkillsCfg(rc, prov, mb, homeDir, config.SkillsCfg{})
 }
 
+func cloneProviderConfigs(in map[string]config.ProviderConfig) map[string]config.ProviderConfig {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]config.ProviderConfig, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
 // NewAgentWithFullCfg creates a new Agent with full config support (memory, privacy, skills learner).
 func NewAgentWithFullCfg(rc config.ResolvedAgent, prov provider.Provider, mb *bus.MessageBus, homeDir string, fullCfg *config.Config) *Agent {
 	ag := NewAgentWithSkillsCfg(rc, prov, mb, homeDir, fullCfg.Skills)
@@ -325,6 +337,11 @@ func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *
 	hooks.Register(AfterToolCall, LoggingHook())
 
 	eng := newSDKEngine(rc.ID)
+	providerConfigs := cloneProviderConfigs(rc.Providers)
+	contextWindow := rc.ContextWindow
+	if contextWindow <= 0 {
+		contextWindow = config.ResolveContextWindow(providerConfigs, rc.Model, rc.MaxTokens)
+	}
 
 	ag := &Agent{
 		name:                 rc.ID,
@@ -336,6 +353,8 @@ func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *
 		hooks:                hooks,
 		model:                rc.Model,
 		maxTokens:            rc.MaxTokens,
+		contextWindow:        contextWindow,
+		providerConfigs:      providerConfigs,
 		temperature:          rc.Temperature,
 		maxToolIterations:    rc.MaxToolIterations,
 		maxParallelToolCalls: rc.MaxParallelToolCalls,
@@ -787,6 +806,23 @@ func (a *Agent) callLLMWithEmergencyRetry(
 	rebuilt := compactionRequestMessages(result.Messages, overhead)
 	retryResp, retryErr := call(rebuilt, callTools)
 	return retryResp, rebuilt, true, retryErr
+}
+
+func (a *Agent) buildRequestOverhead(systemPrompt string, msg bus.InboundMessage, chatterMem *Memory) []provider.Message {
+	messages := []provider.Message{{Role: "system", Content: systemPrompt}}
+	if hints := renderChannelHints(msg, a.splitReplies); hints != "" {
+		messages = append(messages, provider.Message{Role: "system", Content: hints})
+	}
+	if senderMsg := renderSender(msg); senderMsg != "" {
+		messages = append(messages, provider.Message{Role: "system", Content: senderMsg})
+	}
+	if paramsMsg := renderClientParams(msg.Params); paramsMsg != "" {
+		messages = append(messages, provider.Message{Role: "system", Content: paramsMsg})
+	}
+	if reminder := renderChatbotPersistenceReminder(a.promptMode, a.displayName, chatterMem.LoadUserFile(), chatterMem.LoadMemory()); reminder != "" {
+		messages = append(messages, provider.Message{Role: "system", Content: reminder})
+	}
+	return messages
 }
 
 func (a *Agent) streamChatToResponseWithOptions(ctx context.Context, messages []provider.Message, tools []provider.Tool, emitDeltas bool) (*provider.Response, error) {
@@ -1896,7 +1932,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// real reply is coming on the next bus-fired turn." Without it,
 	// the stream closes immediately and the typing indicator vanishes
 	// while the model is still warming up.
-	if result := a.handleSlashCommand(msg); result.handled {
+	if result := a.handleSlashCommand(ctx, msg); result.handled {
 		if result.reply != "" {
 			emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": result.reply}})
 		}
@@ -2698,7 +2734,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	// Reuse setup logic from HandleMessage. Empty reply is "handled
 	// but silent" — see the HandleMessage twin. Still emit a Done
 	// chunk so callers waiting on the stream don't hang.
-	if result := a.handleSlashCommand(msg); result.handled {
+	if result := a.handleSlashCommand(ctx, msg); result.handled {
 		ch := make(chan provider.StreamChunk, 2)
 		go func() {
 			ch <- provider.StreamChunk{Content: result.reply, Done: true}
@@ -3292,6 +3328,11 @@ func (a *Agent) withMessageTimestampsForChatter(msgs []provider.Message, chatter
 func (a *Agent) UpdateConfig(rc config.ResolvedAgent) {
 	a.model = rc.Model
 	a.maxTokens = rc.MaxTokens
+	a.providerConfigs = cloneProviderConfigs(rc.Providers)
+	a.contextWindow = rc.ContextWindow
+	if a.contextWindow <= 0 {
+		a.contextWindow = config.ResolveContextWindow(a.providerConfigs, a.model, a.maxTokens)
+	}
 	a.temperature = rc.Temperature
 	a.maxToolIterations = rc.MaxToolIterations
 	a.maxParallelToolCalls = rc.MaxParallelToolCalls
