@@ -56,6 +56,19 @@ func (f *forcedFinalRetryProvider) ChatStream(_ context.Context, messages []prov
 	return provider.NewStreamReader(ch), nil
 }
 
+type recordingSummaryProvider struct {
+	prompts [][]provider.Message
+}
+
+func (r *recordingSummaryProvider) Chat(_ context.Context, messages []provider.Message, _ []provider.Tool, _ string, _ int, _ float64) (*provider.Response, error) {
+	r.prompts = append(r.prompts, append([]provider.Message(nil), messages...))
+	return &provider.Response{Content: "safe summary"}, nil
+}
+
+func (r *recordingSummaryProvider) ChatStream(context.Context, []provider.Message, []provider.Tool, string, int, float64) (*provider.StreamReader, error) {
+	return nil, nil
+}
+
 func TestIsContextLimitError(t *testing.T) {
 	tests := []struct {
 		name string
@@ -83,6 +96,40 @@ func TestIsContextLimitError(t *testing.T) {
 				t.Fatalf("isContextLimitError(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestLLMRetryDoesNotRetryContextLimitErrors(t *testing.T) {
+	attempts := 0
+	_, err := llmRetry(context.Background(), "test", func(context.Context) (*provider.Response, error) {
+		attempts++
+		return nil, errors.New("too many tokens")
+	})
+	if err == nil || !isContextLimitError(err) {
+		t.Fatalf("err = %v, want context-limit error", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+}
+
+func TestLLMRetryRetriesTransientErrors(t *testing.T) {
+	attempts := 0
+	resp, err := llmRetry(context.Background(), "test", func(context.Context) (*provider.Response, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, errors.New("temporary upstream failure")
+		}
+		return &provider.Response{Content: "ok"}, nil
+	})
+	if err != nil {
+		t.Fatalf("llmRetry: %v", err)
+	}
+	if resp == nil || resp.Content != "ok" {
+		t.Fatalf("resp = %+v, want ok", resp)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
 	}
 }
 
@@ -197,6 +244,63 @@ func TestPlanModeUsesEmergencyRetryWithToolsDisabled(t *testing.T) {
 	}
 	if !strings.Contains(retryText, planModeNudge()) {
 		t.Fatalf("retry request missing plan-mode nudge:\n%s", retryText)
+	}
+}
+
+func TestEmergencyCompactionSummaryPromptIsPrepared(t *testing.T) {
+	mgr := session.NewManager(t.TempDir())
+	sess := mgr.Get("web", "", "chat", "")
+	sess.Append(provider.Message{Role: "user", Content: strings.Repeat("alice@example.com old user ", 30), Origin: provider.OriginUser})
+	sess.Append(provider.Message{Role: "assistant", Content: strings.Repeat("old assistant ", 30), Origin: provider.OriginUser})
+	sess.Append(provider.Message{Role: "user", Content: "KEEP_RECENT_USER_TURN", Origin: provider.OriginUser})
+
+	prov := &recordingSummaryProvider{}
+	a := &Agent{
+		homePath:          t.TempDir(),
+		provider:          prov,
+		model:             "fake-model",
+		contextWindow:     120,
+		maxTokens:         20,
+		piiScrubEnabled:   true,
+		maxToolIterations: 1,
+	}
+	overhead := []provider.Message{{Role: "system", Content: strings.Repeat("overhead ", 5)}}
+	messages := compactionRequestMessages(sess.GetMessages(), overhead)
+
+	attempts := 0
+	_, _, retried, err := a.callLLMWithEmergencyRetry(
+		context.Background(),
+		sess,
+		overhead,
+		nil,
+		messages,
+		nil,
+		false,
+		nil,
+		a.prepareOutboundMessages,
+		func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
+			attempts++
+			if attempts == 1 {
+				return nil, errors.New("too many tokens")
+			}
+			return &provider.Response{Content: "ok"}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("callLLMWithEmergencyRetry: %v", err)
+	}
+	if !retried {
+		t.Fatal("retried = false, want true")
+	}
+	if len(prov.prompts) == 0 {
+		t.Fatal("summary provider was not called")
+	}
+	text := messagesText(prov.prompts[0])
+	if strings.Contains(text, "alice@example.com") {
+		t.Fatalf("summary prompt leaked email:\n%s", text)
+	}
+	if !strings.Contains(text, "[EMAIL]") {
+		t.Fatalf("summary prompt missing redacted email:\n%s", text)
 	}
 }
 

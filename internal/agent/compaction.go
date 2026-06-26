@@ -45,24 +45,28 @@ const (
 )
 
 type CompactOptions struct {
-	Mode                 CompactMode
-	Workspace            string
-	Provider             provider.Provider
-	Model                string
-	ContextWindow        int
-	MaxOutputTokens      int
-	TriggerPercent       int
-	TargetPercent        int
-	TailTargetPercent    int
-	TailTargetMessages   int
-	MinTailTurns         int
-	Focus                string
-	OverheadMessages     []provider.Message
-	ToolDefs             []provider.Tool
-	BuildRequestMessages func([]provider.Message) []provider.Message
-	SummaryMaxRetries    int
-	Ctx                  context.Context
-	OnTriggered          func()
+	Mode               CompactMode
+	Workspace          string
+	Provider           provider.Provider
+	Model              string
+	ContextWindow      int
+	MaxOutputTokens    int
+	TriggerPercent     int
+	TargetPercent      int
+	TailTargetPercent  int
+	TailTargetMessages int
+	MinTailTurns       int
+	Focus              string
+	OverheadMessages   []provider.Message
+	ToolDefs           []provider.Tool
+	// BuildRequestMessages returns the complete outbound request shape for
+	// token estimation, including overhead and timestamp decoration. When
+	// set, it replaces OverheadMessages for request token estimation.
+	BuildRequestMessages   func([]provider.Message) []provider.Message
+	PrepareSummaryMessages func([]provider.Message) []provider.Message
+	SummaryMaxRetries      int
+	Ctx                    context.Context
+	OnTriggered            func()
 }
 
 // EstimateTokens provides a rough token estimate: chars/4.
@@ -601,7 +605,11 @@ func summarizeWithRetries(opts CompactOptions, prompt []provider.Message) (strin
 
 	var lastErr error
 	for attempt := 0; attempt < opts.SummaryMaxRetries; attempt++ {
-		resp, err := opts.Provider.Chat(ctx, prompt, nil, opts.Model, 2048, 0.3)
+		request := prompt
+		if opts.PrepareSummaryMessages != nil {
+			request = opts.PrepareSummaryMessages(prompt)
+		}
+		resp, err := opts.Provider.Chat(ctx, request, nil, opts.Model, 2048, 0.3)
 		if err != nil {
 			lastErr = err
 			continue

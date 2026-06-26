@@ -759,17 +759,18 @@ func (a *Agent) compactionOptions(mode CompactMode, overhead []provider.Message,
 		buildRequestMessages = buildRequest[0]
 	}
 	return CompactOptions{
-		Mode:                 mode,
-		Workspace:            a.homePath,
-		Provider:             a.provider,
-		Model:                a.model,
-		ContextWindow:        contextWindow,
-		MaxOutputTokens:      a.maxTokens,
-		OverheadMessages:     overhead,
-		ToolDefs:             toolDefs,
-		BuildRequestMessages: buildRequestMessages,
-		MinTailTurns:         MinimumTailTurns,
-		SummaryMaxRetries:    DefaultSummaryMaxRetries,
+		Mode:                   mode,
+		Workspace:              a.homePath,
+		Provider:               a.provider,
+		Model:                  a.model,
+		ContextWindow:          contextWindow,
+		MaxOutputTokens:        a.maxTokens,
+		OverheadMessages:       overhead,
+		ToolDefs:               toolDefs,
+		BuildRequestMessages:   buildRequestMessages,
+		PrepareSummaryMessages: a.prepareOutboundMessages,
+		MinTailTurns:           MinimumTailTurns,
+		SummaryMaxRetries:      DefaultSummaryMaxRetries,
 	}
 }
 
@@ -785,6 +786,13 @@ func (a *Agent) compactWithProgress(ctx context.Context, sessionMsgs []provider.
 type modelCallFunc func(request []provider.Message, tools []provider.Tool) (*provider.Response, error)
 type modelRequestBuildFunc func(sessionMessages []provider.Message) []provider.Message
 type modelRequestPrepareFunc func([]provider.Message) []provider.Message
+
+func (a *Agent) prepareOutboundMessages(request []provider.Message) []provider.Message {
+	if a.piiScrubEnabled {
+		return privacy.ScrubMessages(request)
+	}
+	return request
+}
 
 func buildModelRequest(sessionMessages []provider.Message, overhead []provider.Message, build modelRequestBuildFunc) []provider.Message {
 	if build != nil {
@@ -1858,12 +1866,7 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 	buildRequest := func(sessionMessages []provider.Message) []provider.Message {
 		return compactionRequestMessages(a.withMessageTimestampsForChatter(sessionMessages, chatterUID), overheadMessages)
 	}
-	prepareModelRequest := func(request []provider.Message) []provider.Message {
-		if a.piiScrubEnabled {
-			return privacy.ScrubMessages(request)
-		}
-		return request
-	}
+	prepareOutbound := a.prepareOutboundMessages
 
 	sessionMsgs := sess.GetMessages()
 	compactResult, err := a.compactWithProgress(ctx, sessionMsgs, a.compactionOptions(CompactModeProactive, overheadMessages, nil, sess.SessionKey(), buildRequest))
@@ -1877,7 +1880,7 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 	}
 
 	messages := buildRequest(sessionMsgs)
-	resp, updatedMessages, didRetry, err := a.callLLMWithEmergencyRetry(ctx, sess, overheadMessages, nil, messages, nil, false, buildRequest, prepareModelRequest, func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
+	resp, updatedMessages, didRetry, err := a.callLLMWithEmergencyRetry(ctx, sess, overheadMessages, nil, messages, nil, false, buildRequest, prepareOutbound, func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
 		return a.streamChatToResponse(ctx, request, tools)
 	})
 	if didRetry {
@@ -1963,8 +1966,9 @@ func llmRetry(ctx context.Context, label string, fn func(context.Context) (*prov
 		}
 		lastErr = err
 
-		// Context errors are terminal — don't retry.
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		// Context and context-limit errors are terminal: cancellation cannot
+		// recover, and oversize requests need compaction rather than retries.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isContextLimitError(err) {
 			return nil, err
 		}
 
@@ -2159,12 +2163,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	}
 
 	messages := buildRequest(sessionMsgs)
-	prepareModelRequest := func(request []provider.Message) []provider.Message {
-		if a.piiScrubEnabled {
-			return privacy.ScrubMessages(request)
-		}
-		return request
-	}
+	prepareOutbound := a.prepareOutboundMessages
 	// Loop detection: track consecutive identical tool calls
 	type toolCallSig struct {
 		name string
@@ -2234,7 +2233,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				),
 			})
 		}
-		resp, updatedMessages, didRetry, err := a.callLLMWithEmergencyRetry(ctx, sess, overheadMessages, toolDefs, llmMessages, callTools, emergencyRetried, buildRequest, prepareModelRequest, func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
+		resp, updatedMessages, didRetry, err := a.callLLMWithEmergencyRetry(ctx, sess, overheadMessages, toolDefs, llmMessages, callTools, emergencyRetried, buildRequest, prepareOutbound, func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
 			dumpLLMRequest(a.name, a.model, request, tools)
 			return llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
 				return a.streamChatToResponse(ctx, request, tools)
@@ -2531,7 +2530,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// with zero deliverable after a full iteration budget got burned.
 	finalMessages := append(append([]provider.Message(nil), messages...), capReachedNudge(a.maxToolIterations))
 	finalContent := ""
-	finalResp, updatedMessages, didRetry, finalErr := a.callLLMWithEmergencyRetry(ctx, sess, overheadMessages, toolDefs, finalMessages, nil, emergencyRetried, buildRequest, prepareModelRequest, func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
+	finalResp, updatedMessages, didRetry, finalErr := a.callLLMWithEmergencyRetry(ctx, sess, overheadMessages, toolDefs, finalMessages, nil, emergencyRetried, buildRequest, prepareOutbound, func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
 		return a.streamChatToResponseQuiet(ctx, request, tools)
 	})
 	if didRetry {
