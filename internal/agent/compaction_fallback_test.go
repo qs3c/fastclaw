@@ -45,6 +45,7 @@ func TestIsContextLimitError(t *testing.T) {
 		{name: "rate limit exceeded", err: errors.New("rate limit exceeded"), want: false},
 		{name: "rate limit tokens per minute", err: errors.New("rate limit: too many tokens per minute"), want: false},
 		{name: "quota exceeded", err: errors.New("quota exceeded"), want: false},
+		{name: "throttle", err: errors.New("request throttle exceeded"), want: false},
 	}
 
 	for _, tt := range tests {
@@ -101,6 +102,9 @@ func TestEmergencyRetryRetriesWithinSameIteration(t *testing.T) {
 		maxTokens:     20,
 	}
 	overhead := []provider.Message{{Role: "system", Content: strings.Repeat("overhead ", 5)}}
+	if got := a.compactionOptions(CompactModeEmergency, overhead, nil, sess.SessionKey()).MinTailTurns; got != MinimumTailTurns {
+		t.Fatalf("emergency compaction MinTailTurns = %d, want %d", got, MinimumTailTurns)
+	}
 	messages := compactionRequestMessages(sess.GetMessages(), overhead)
 
 	attempts := 0

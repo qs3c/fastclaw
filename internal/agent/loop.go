@@ -743,6 +743,7 @@ func (a *Agent) compactionOptions(mode CompactMode, overhead []provider.Message,
 		MaxOutputTokens:   a.maxTokens,
 		OverheadMessages:  overhead,
 		ToolDefs:          toolDefs,
+		MinTailTurns:      MinimumTailTurns,
 		SummaryMaxRetries: DefaultSummaryMaxRetries,
 	}
 }
