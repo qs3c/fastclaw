@@ -777,6 +777,14 @@ func (a *Agent) compactWithProgress(ctx context.Context, sessionMsgs []provider.
 }
 
 type modelCallFunc func(request []provider.Message, tools []provider.Tool) (*provider.Response, error)
+type modelRequestPrepareFunc func([]provider.Message) []provider.Message
+
+func prepareModelRequest(messages []provider.Message, prepare modelRequestPrepareFunc) []provider.Message {
+	if prepare == nil {
+		return messages
+	}
+	return prepare(messages)
+}
 
 func (a *Agent) callLLMWithEmergencyRetry(
 	ctx context.Context,
@@ -786,9 +794,11 @@ func (a *Agent) callLLMWithEmergencyRetry(
 	messages []provider.Message,
 	callTools []provider.Tool,
 	alreadyRetried bool,
+	prepare modelRequestPrepareFunc,
 	call modelCallFunc,
 ) (*provider.Response, []provider.Message, bool, error) {
-	resp, err := call(messages, callTools)
+	request := prepareModelRequest(messages, prepare)
+	resp, err := call(request, callTools)
 	if err == nil || alreadyRetried || !isContextLimitError(err) {
 		return resp, messages, false, err
 	}
@@ -804,7 +814,8 @@ func (a *Agent) callLLMWithEmergencyRetry(
 
 	sess.ReplaceMessages(result.Messages)
 	rebuilt := compactionRequestMessages(result.Messages, overhead)
-	retryResp, retryErr := call(rebuilt, callTools)
+	retryRequest := prepareModelRequest(rebuilt, prepare)
+	retryResp, retryErr := call(retryRequest, callTools)
 	return retryResp, rebuilt, true, retryErr
 }
 
@@ -2132,10 +2143,12 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		hcBefore := &HookContext{AgentName: a.name, Point: BeforeModelCall, Messages: messages, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID}
 		a.hooks.Run(ctx, hcBefore)
 
-		// PII scrubbing: redact sensitive data before sending to LLM
 		llmMessages := messages
-		if a.piiScrubEnabled {
-			llmMessages = privacy.ScrubMessages(messages)
+		prepareModelRequest := func(request []provider.Message) []provider.Message {
+			if a.piiScrubEnabled {
+				return privacy.ScrubMessages(request)
+			}
+			return request
 		}
 
 		if a.provider == nil {
@@ -2163,7 +2176,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				),
 			})
 		}
-		resp, updatedMessages, didRetry, err := a.callLLMWithEmergencyRetry(ctx, sess, overheadMessages, toolDefs, llmMessages, callTools, emergencyRetried, func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
+		resp, updatedMessages, didRetry, err := a.callLLMWithEmergencyRetry(ctx, sess, overheadMessages, toolDefs, llmMessages, callTools, emergencyRetried, prepareModelRequest, func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
 			dumpLLMRequest(a.name, a.model, request, tools)
 			return llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
 				return a.streamChatToResponse(ctx, request, tools)

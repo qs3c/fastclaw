@@ -116,6 +116,7 @@ func TestEmergencyRetryRetriesWithinSameIteration(t *testing.T) {
 		messages,
 		nil,
 		false,
+		nil,
 		func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
 			attempts++
 			if attempts == 1 {
@@ -148,6 +149,72 @@ func TestEmergencyRetryRetriesWithinSameIteration(t *testing.T) {
 	}
 }
 
+func TestEmergencyRetryPreparesRetryRequest(t *testing.T) {
+	mgr := session.NewManager(t.TempDir())
+	sess := mgr.Get("web", "", "chat", "")
+	sess.Append(provider.Message{Role: "user", Content: strings.Repeat("old SECRET_TOKEN user ", 40), Origin: provider.OriginUser})
+	sess.Append(provider.Message{Role: "assistant", Content: strings.Repeat("old SECRET_TOKEN assistant ", 40), Origin: provider.OriginUser})
+	sess.Append(provider.Message{Role: "user", Content: "KEEP_RECENT_SECRET_TOKEN_USER_TURN", Origin: provider.OriginUser})
+
+	a := &Agent{
+		homePath:      t.TempDir(),
+		model:         "fake-model",
+		contextWindow: 120,
+		maxTokens:     20,
+	}
+	overhead := []provider.Message{{Role: "system", Content: strings.Repeat("overhead ", 5)}}
+	messages := compactionRequestMessages(sess.GetMessages(), overhead)
+
+	attempts := 0
+	var sentTexts []string
+	resp, rebuilt, retried, err := a.callLLMWithEmergencyRetry(
+		context.Background(),
+		sess,
+		overhead,
+		nil,
+		messages,
+		nil,
+		false,
+		redactSecretToken,
+		func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
+			attempts++
+			text := messagesText(request)
+			sentTexts = append(sentTexts, text)
+			if strings.Contains(text, "SECRET_TOKEN") {
+				t.Fatalf("attempt %d sent raw secret:\n%s", attempts, text)
+			}
+			if !strings.Contains(text, "[REDACTED]") {
+				t.Fatalf("attempt %d missing redaction:\n%s", attempts, text)
+			}
+			if attempts == 1 {
+				return nil, errors.New("too many tokens")
+			}
+			if !strings.Contains(text, "[Reactive Context Summary]") {
+				t.Fatalf("retry request missing reactive summary:\n%s", text)
+			}
+			return &provider.Response{Content: "ok"}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("callLLMWithEmergencyRetry: %v", err)
+	}
+	if resp == nil || resp.Content != "ok" {
+		t.Fatalf("response = %+v, want ok", resp)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if !retried {
+		t.Fatal("retried = false, want true")
+	}
+	if len(sentTexts) != 2 {
+		t.Fatalf("sentTexts = %d, want 2", len(sentTexts))
+	}
+	if !strings.Contains(messagesText(rebuilt), "SECRET_TOKEN") {
+		t.Fatalf("rebuilt canonical messages missing raw secret:\n%s", messagesText(rebuilt))
+	}
+}
+
 func longConversation() []provider.Message {
 	var msgs []provider.Message
 	for i := 0; i < 12; i++ {
@@ -158,6 +225,15 @@ func longConversation() []provider.Message {
 		)
 	}
 	return msgs
+}
+
+func redactSecretToken(messages []provider.Message) []provider.Message {
+	out := make([]provider.Message, len(messages))
+	copy(out, messages)
+	for i := range out {
+		out[i].Content = strings.ReplaceAll(out[i].Content, "SECRET_TOKEN", "[REDACTED]")
+	}
+	return out
 }
 
 func messagesText(messages []provider.Message) string {
