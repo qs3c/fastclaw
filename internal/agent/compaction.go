@@ -380,7 +380,7 @@ func completeTurnTailCandidate(messages []provider.Message, targetTokens, minKee
 
 	userStarts := make([]int, 0)
 	for i, msg := range messages {
-		if msg.Role == "user" {
+		if msg.Role == "user" && msg.Origin == provider.OriginUser {
 			userStarts = append(userStarts, i)
 		}
 	}
@@ -557,45 +557,6 @@ func summarizeWithRetries(opts CompactOptions, prompt []provider.Message) (strin
 		return "", fmt.Errorf("summarize conversation: response content is empty")
 	}
 	return resp.Content, nil
-}
-
-func deterministicSummaryFallback(messages []provider.Message) string {
-	const marker = "deterministic fallback: LLM summary failed. Older messages were compacted without an LLM."
-
-	lines := []string{marker}
-	totalRunes := runeCount(marker)
-	for _, m := range messages {
-		if m.Origin != provider.OriginUser {
-			continue
-		}
-		text := strings.TrimSpace(m.TextContent())
-		if text == "" {
-			continue
-		}
-		line := fmt.Sprintf("[%s] %s", m.Role, snippetForFallback(text))
-		nextRunes := totalRunes + 1 + runeCount(line)
-		if nextRunes > fallbackSummaryMaxRunes {
-			lines = append(lines, "[fallback summary truncated]")
-			break
-		}
-		lines = append(lines, line)
-		totalRunes = nextRunes
-	}
-
-	return strings.Join(lines, "\n")
-}
-
-func snippetForFallback(text string) string {
-	normalized := strings.Join(strings.Fields(text), " ")
-	runes := []rune(normalized)
-	if len(runes) <= fallbackSnippetMaxRunes {
-		return normalized
-	}
-	return string(runes[:fallbackSnippetMaxRunes]) + "..."
-}
-
-func runeCount(s string) int {
-	return len([]rune(s))
 }
 
 // writeHistoryLog writes the full message history to a JSONL log file.

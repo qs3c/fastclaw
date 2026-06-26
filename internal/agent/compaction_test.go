@@ -279,6 +279,31 @@ func TestCompactionTailStartTargetsThirtyPercentTokensWithTwoTurnMinimum(t *test
 	}
 }
 
+func TestCompactionTailStartIgnoresGoalContextForMinimumUserTurns(t *testing.T) {
+	var msgs []provider.Message
+	for i := 0; i < 3; i++ {
+		msgs = append(msgs,
+			provider.Message{Role: "user", Content: strings.Repeat("old real user ", 4), Origin: provider.OriginUser},
+			provider.Message{Role: "assistant", Content: strings.Repeat("old assistant ", 4), Origin: provider.OriginUser},
+		)
+	}
+	goalIndex := len(msgs)
+	msgs = append(msgs,
+		provider.Message{Role: "user", Content: strings.Repeat("synthetic goal context ", 120), Origin: provider.OriginGoalContext},
+		provider.Message{Role: "assistant", Content: strings.Repeat("goal assistant ", 20), Origin: provider.OriginUser},
+		provider.Message{Role: "user", Content: strings.Repeat("recent real user ", 40), Origin: provider.OriginUser},
+		provider.Message{Role: "assistant", Content: strings.Repeat("recent assistant ", 40), Origin: provider.OriginUser},
+	)
+
+	cutoff := compactionTailStart(msgs, CompactOptions{ContextWindow: 1000, MinTailTurns: MinimumTailTurns})
+	if cutoff == goalIndex {
+		t.Fatalf("tail start = goal context index %d; goal_context must not count as a real user turn", cutoff)
+	}
+	if turns := realUserTurns(msgs[cutoff:]); turns < MinimumTailTurns {
+		t.Fatalf("tail has %d real user turns, want at least %d", turns, MinimumTailTurns)
+	}
+}
+
 func realUserTurns(messages []provider.Message) int {
 	count := 0
 	for _, msg := range messages {
