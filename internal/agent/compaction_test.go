@@ -14,9 +14,11 @@ import (
 // about the summary content, only the input.
 type fakeSummarizer struct {
 	gotSummaryRequest string
+	gotCtx            context.Context
 }
 
-func (f *fakeSummarizer) Chat(_ context.Context, msgs []provider.Message, _ []provider.Tool, _ string, _ int, _ float64) (*provider.Response, error) {
+func (f *fakeSummarizer) Chat(ctx context.Context, msgs []provider.Message, _ []provider.Tool, _ string, _ int, _ float64) (*provider.Response, error) {
+	f.gotCtx = ctx
 	// compressOlderMessages builds the user-role prompt as the
 	// second message; the older-history text lives in its Content
 	// after the "Summarize this conversation:\n\n" prefix.
@@ -49,7 +51,7 @@ func TestCompactionDropsGoalContextFromSummary(t *testing.T) {
 	}
 
 	f := &fakeSummarizer{}
-	out, err := compressOlderMessages(msgs, f, "fake-model")
+	out, err := compressOlderMessages(msgs, CompactOptions{Provider: f, Model: "fake-model"})
 	if err != nil {
 		t.Fatalf("compress: %v", err)
 	}
@@ -83,7 +85,7 @@ func TestCompactionPreservesContentWhenShortCircuits(t *testing.T) {
 		{Role: "user", Content: "hi"},
 		{Role: "assistant", Content: "hello"},
 	}
-	out, err := compressOlderMessages(in, nil, "")
+	out, err := compressOlderMessages(in, CompactOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -194,7 +196,7 @@ func TestCompressOlderMessagesNeverStartsTailWithTool(t *testing.T) {
 	}
 
 	f := &fakeSummarizer{}
-	out, err := compressOlderMessages(msgs, f, "fake-model")
+	out, err := compressOlderMessages(msgs, CompactOptions{Provider: f, Model: "fake-model"})
 	if err != nil {
 		t.Fatalf("compress: %v", err)
 	}
@@ -221,4 +223,68 @@ func TestCompressOlderMessagesNeverStartsTailWithTool(t *testing.T) {
 			t.Errorf("tool at idx %d has no parent assistant.tool_calls in output", i)
 		}
 	}
+}
+
+func TestManualCompactionRunsBelowProactiveThreshold(t *testing.T) {
+	var msgs []provider.Message
+	for i := 0; i < 12; i++ {
+		msgs = append(msgs,
+			provider.Message{Role: "user", Content: strings.Repeat("u", 20), Origin: provider.OriginUser},
+			provider.Message{Role: "assistant", Content: strings.Repeat("a", 20), Origin: provider.OriginUser},
+		)
+	}
+
+	f := &fakeSummarizer{}
+	res, err := CompactMessagesWithOptions(msgs, CompactOptions{
+		Mode:              CompactModeManual,
+		Provider:          f,
+		Model:             "fake-model",
+		ContextWindow:     1_000_000,
+		Focus:             "focus on filesystem changes",
+		MinTailTurns:      2,
+		SummaryMaxRetries: 3,
+	})
+	if err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if !res.Pruned {
+		t.Fatal("manual compaction should prune below proactive threshold")
+	}
+	if !strings.Contains(f.gotSummaryRequest, "Manual compaction focus:\nfocus on filesystem changes") {
+		t.Fatalf("summary request missing manual focus:\n%s", f.gotSummaryRequest)
+	}
+}
+
+func TestCompactionTailStartTargetsThirtyPercentTokensWithTwoTurnMinimum(t *testing.T) {
+	var msgs []provider.Message
+	for i := 0; i < 10; i++ {
+		msgs = append(msgs,
+			provider.Message{Role: "user", Content: strings.Repeat("u", 3), Origin: provider.OriginUser},
+			provider.Message{Role: "assistant", Content: strings.Repeat("a", 3), Origin: provider.OriginUser},
+		)
+	}
+	for i := 0; i < 2; i++ {
+		msgs = append(msgs,
+			provider.Message{Role: "user", Content: strings.Repeat("u", 280), Origin: provider.OriginUser},
+			provider.Message{Role: "assistant", Content: strings.Repeat("a", 280), Origin: provider.OriginUser},
+		)
+	}
+
+	cutoff := compactionTailStart(msgs, CompactOptions{ContextWindow: 1000})
+	if cutoff != 20 {
+		t.Fatalf("cutoff = %d, want 20", cutoff)
+	}
+	if turns := realUserTurns(msgs[cutoff:]); turns < MinimumTailTurns {
+		t.Fatalf("tail has %d real user turns, want at least %d", turns, MinimumTailTurns)
+	}
+}
+
+func realUserTurns(messages []provider.Message) int {
+	count := 0
+	for _, msg := range messages {
+		if msg.Role == "user" && msg.Origin == provider.OriginUser {
+			count++
+		}
+	}
+	return count
 }
