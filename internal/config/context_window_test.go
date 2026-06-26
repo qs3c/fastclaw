@@ -17,6 +17,21 @@ func TestResolveContextWindowUsesProviderPrefixedModelID(t *testing.T) {
 	}
 }
 
+func TestResolveContextWindowTrimsModelWhitespace(t *testing.T) {
+	providers := map[string]ProviderConfig{
+		"openai": {
+			Models: []ModelEntry{
+				{ID: "gpt-4.1", ContextWindow: 1048576},
+			},
+		},
+	}
+
+	got := ResolveContextWindow(providers, "  openai/gpt-4.1 \t", 8192)
+	if got != 1048576 {
+		t.Fatalf("context window = %d, want 1048576", got)
+	}
+}
+
 func TestResolveContextWindowUsesLongestProviderPrefix(t *testing.T) {
 	providers := map[string]ProviderConfig{
 		"openrouter": {
