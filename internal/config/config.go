@@ -13,6 +13,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -333,6 +334,78 @@ type ProviderConfig struct {
 	Models   []ModelEntry `json:"models,omitempty"`
 }
 
+const DefaultContextWindow = 128000
+
+// ResolveContextWindow returns the model context window from provider metadata.
+func ResolveContextWindow(providers map[string]ProviderConfig, model string, maxTokens int) int {
+	model = strings.TrimSpace(model)
+	if model != "" && len(providers) > 0 {
+		if contextWindow, ok := resolvePrefixedModelContextWindow(providers, model); ok {
+			return contextWindow
+		}
+		if contextWindow, ok := resolveAnyProviderModelContextWindow(providers, model); ok {
+			return contextWindow
+		}
+	}
+	return fallbackContextWindow(maxTokens)
+}
+
+func fallbackContextWindow(maxTokens int) int {
+	if maxTokens > DefaultContextWindow {
+		return maxTokens
+	}
+	return DefaultContextWindow
+}
+
+func resolvePrefixedModelContextWindow(providers map[string]ProviderConfig, model string) (int, bool) {
+	for _, providerID := range sortedProviderKeysByLength(providers) {
+		prefix := providerID + "/"
+		if !strings.HasPrefix(model, prefix) {
+			continue
+		}
+		return resolveProviderModelContextWindow(providers[providerID], strings.TrimPrefix(model, prefix))
+	}
+	return 0, false
+}
+
+func resolveAnyProviderModelContextWindow(providers map[string]ProviderConfig, model string) (int, bool) {
+	for _, providerID := range sortedProviderKeys(providers) {
+		if contextWindow, ok := resolveProviderModelContextWindow(providers[providerID], model); ok {
+			return contextWindow, true
+		}
+	}
+	return 0, false
+}
+
+func resolveProviderModelContextWindow(provider ProviderConfig, model string) (int, bool) {
+	for _, entry := range provider.Models {
+		if entry.ContextWindow <= 0 {
+			continue
+		}
+		if entry.ID == model || entry.Name == model {
+			return entry.ContextWindow, true
+		}
+	}
+	return 0, false
+}
+
+func sortedProviderKeys(providers map[string]ProviderConfig) []string {
+	keys := make([]string, 0, len(providers))
+	for key := range providers {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sortedProviderKeysByLength(providers map[string]ProviderConfig) []string {
+	keys := sortedProviderKeys(providers)
+	sort.SliceStable(keys, func(i, j int) bool {
+		return len(keys[i]) > len(keys[j])
+	})
+	return keys
+}
+
 // UnmarshalJSON handles a long-deprecated `api` alias for `apiType`.
 func (pc *ProviderConfig) UnmarshalJSON(data []byte) error {
 	type Alias ProviderConfig
@@ -611,6 +684,7 @@ type ResolvedAgent struct {
 	Workspace            string
 	Model                string
 	MaxTokens            int
+	ContextWindow        int
 	Temperature          float64
 	MaxToolIterations    int
 	MaxParallelToolCalls int
@@ -639,6 +713,13 @@ type ResolvedAgent struct {
 	// runPostTurn hook fires AutoPersistMemory (the LLM-driven distill-
 	// to-USER.md/MEMORY.md pass) every N turns.
 	AutoPersist *bool
+}
+
+func (rc *ResolvedAgent) RefreshModelContextWindow() {
+	if rc == nil {
+		return
+	}
+	rc.ContextWindow = ResolveContextWindow(rc.Providers, rc.Model, rc.MaxTokens)
 }
 
 type TeamEntry struct {
@@ -875,6 +956,7 @@ func (cfg *Config) MergedAgentConfig(entry AgentEntry) ResolvedAgent {
 		}
 	}
 
+	resolved.RefreshModelContextWindow()
 	return resolved
 }
 
