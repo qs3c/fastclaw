@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/fastclaw-ai/fastclaw/internal/agent/tools"
+	"github.com/fastclaw-ai/fastclaw/internal/bus"
 	"github.com/fastclaw-ai/fastclaw/internal/provider"
 	"github.com/fastclaw-ai/fastclaw/internal/session"
 )
@@ -25,6 +27,29 @@ func (f *flakySummarizer) Chat(context.Context, []provider.Message, []provider.T
 
 func (f *flakySummarizer) ChatStream(context.Context, []provider.Message, []provider.Tool, string, int, float64) (*provider.StreamReader, error) {
 	return nil, nil
+}
+
+type forcedFinalRetryProvider struct {
+	streamCalls int
+	requests    [][]provider.Message
+	tools       [][]provider.Tool
+}
+
+func (f *forcedFinalRetryProvider) Chat(context.Context, []provider.Message, []provider.Tool, string, int, float64) (*provider.Response, error) {
+	return &provider.Response{Content: "llm summary"}, nil
+}
+
+func (f *forcedFinalRetryProvider) ChatStream(_ context.Context, messages []provider.Message, tools []provider.Tool, _ string, _ int, _ float64) (*provider.StreamReader, error) {
+	f.streamCalls++
+	f.requests = append(f.requests, append([]provider.Message(nil), messages...))
+	f.tools = append(f.tools, append([]provider.Tool(nil), tools...))
+	if f.streamCalls == 1 {
+		return nil, errors.New("too many tokens")
+	}
+	ch := make(chan provider.StreamChunk, 1)
+	ch <- provider.StreamChunk{Content: "FORCED_FINAL_OK", Done: true}
+	close(ch)
+	return provider.NewStreamReader(ch), nil
 }
 
 func TestIsContextLimitError(t *testing.T) {
@@ -54,6 +79,64 @@ func TestIsContextLimitError(t *testing.T) {
 				t.Fatalf("isContextLimitError(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestForcedFinalDeliveryUsesEmergencyRetryAndKeepsCapNudgeRequestOnly(t *testing.T) {
+	home := t.TempDir()
+	sessions := session.NewManager(t.TempDir())
+	msg := bus.InboundMessage{
+		Text:      "new request",
+		Channel:   "web",
+		AccountID: "acct-1",
+		ChatID:    "chat-1",
+		UserID:    "owner-1",
+	}
+	sess := sessions.Get(msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
+	for i := 0; i < 12; i++ {
+		sess.Append(provider.Message{Role: "user", Content: strings.Repeat("old user ", 20), Origin: provider.OriginUser})
+		sess.Append(provider.Message{Role: "assistant", Content: strings.Repeat("old assistant ", 20), Origin: provider.OriginUser})
+	}
+
+	prov := &forcedFinalRetryProvider{}
+	mem := NewMemory(home)
+	a := &Agent{
+		name:              "agent-test",
+		provider:          prov,
+		registry:          tools.NewRegistry(home, home),
+		sessions:          sessions,
+		memory:            mem,
+		ctxBuilder:        NewContextBuilder(home, mem, ""),
+		hooks:             NewHookRegistry(),
+		model:             "fake-model",
+		maxTokens:         20,
+		maxToolIterations: 0,
+		contextWindow:     120,
+		homePath:          home,
+		homeDir:           home,
+		ownerUserID:       "owner-1",
+	}
+
+	reply := a.HandleMessage(context.Background(), msg)
+
+	if !strings.Contains(reply, "FORCED_FINAL_OK") {
+		t.Fatalf("reply = %q, want forced final retry content", reply)
+	}
+	if prov.streamCalls != 2 {
+		t.Fatalf("streamCalls = %d, want 2", prov.streamCalls)
+	}
+	if len(prov.tools) != 2 || len(prov.tools[0]) != 0 || len(prov.tools[1]) != 0 {
+		t.Fatalf("forced final tools = %+v, want no tools on both attempts", prov.tools)
+	}
+	retryText := messagesText(prov.requests[1])
+	if !strings.Contains(retryText, "[Reactive Context Summary]") {
+		t.Fatalf("retry request missing reactive summary:\n%s", retryText)
+	}
+	if !strings.Contains(retryText, "You've used all 0 tool-call iterations") {
+		t.Fatalf("retry request missing cap nudge:\n%s", retryText)
+	}
+	if strings.Contains(messagesText(sess.GetMessages()), "You've used all 0 tool-call iterations") {
+		t.Fatalf("session messages included request-only cap nudge:\n%s", messagesText(sess.GetMessages()))
 	}
 }
 

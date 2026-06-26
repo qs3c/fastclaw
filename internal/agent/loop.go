@@ -2132,6 +2132,12 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		return compactionRequestMessages(a.withMessageTimestampsForChatter(sessionMessages, chatterUID), overheadMessages)
 	}
 	messages := buildRequest(sessionMsgs)
+	prepareModelRequest := func(request []provider.Message) []provider.Message {
+		if a.piiScrubEnabled {
+			return privacy.ScrubMessages(request)
+		}
+		return request
+	}
 	// Loop detection: track consecutive identical tool calls
 	type toolCallSig struct {
 		name string
@@ -2175,12 +2181,6 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		a.hooks.Run(ctx, hcBefore)
 
 		llmMessages := messages
-		prepareModelRequest := func(request []provider.Message) []provider.Message {
-			if a.piiScrubEnabled {
-				return privacy.ScrubMessages(request)
-			}
-			return request
-		}
 
 		if a.provider == nil {
 			slog.Error("agent has no provider configured", "agent", a.name, "model", a.model)
@@ -2508,12 +2508,15 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// nudge that tells the model to synthesize what it has. Replaces the
 	// old behavior of just returning a canned warning, which left users
 	// with zero deliverable after a full iteration budget got burned.
-	finalMessages := append(messages, capReachedNudge(a.maxToolIterations))
-	if a.piiScrubEnabled {
-		finalMessages = privacy.ScrubMessages(finalMessages)
-	}
+	finalMessages := append(append([]provider.Message(nil), messages...), capReachedNudge(a.maxToolIterations))
 	finalContent := ""
-	finalResp, finalErr := a.streamChatToResponseQuiet(ctx, finalMessages, nil)
+	finalResp, updatedMessages, didRetry, finalErr := a.callLLMWithEmergencyRetry(ctx, sess, overheadMessages, toolDefs, finalMessages, nil, emergencyRetried, buildRequest, prepareModelRequest, func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
+		return a.streamChatToResponseQuiet(ctx, request, tools)
+	})
+	if didRetry {
+		emergencyRetried = true
+		messages = updatedMessages
+	}
 	if finalErr == nil {
 		finalContent = scrubLeakedToolCallContent(finalResp.Content)
 		a.meterTokens(ctx, sess.Key(), finalResp.Usage, 0)
