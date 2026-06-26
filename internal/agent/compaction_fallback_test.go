@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -60,6 +61,7 @@ type streamingEmergencyProvider struct {
 	failFirstChat   bool
 	failFirstStream bool
 	streamContent   string
+	firstChatTool   string
 
 	chatCalls      int
 	chatRequests   [][]provider.Message
@@ -81,6 +83,19 @@ func (s *streamingEmergencyProvider) Chat(_ context.Context, messages []provider
 	s.chatTools = append(s.chatTools, append([]provider.Tool(nil), tools...))
 	if s.failFirstChat && s.chatCalls == 1 {
 		return nil, errors.New("too many tokens")
+	}
+	if s.firstChatTool != "" && s.chatCalls == 1 {
+		return &provider.Response{
+			Content: "using tool",
+			ToolCalls: []provider.ToolCall{{
+				ID:   "call-stream-test",
+				Type: "function",
+				Function: provider.FunctionCall{
+					Name:      s.firstChatTool,
+					Arguments: "{}",
+				},
+			}},
+		}, nil
 	}
 	return &provider.Response{Content: "non-stream final seed"}, nil
 }
@@ -308,6 +323,88 @@ func TestForcedFinalDeliveryStreamUsesEmergencyRetryAndKeepsCapNudgeRequestOnly(
 	}
 	if strings.Contains(messagesText(sess.GetMessages()), "You've used all 0 tool-call iterations") {
 		t.Fatalf("session messages included request-only cap nudge:\n%s", messagesText(sess.GetMessages()))
+	}
+}
+
+func TestHandleMessageStreamForcedFinalRetryKeepsCapNudgeAfterToolIteration(t *testing.T) {
+	home := t.TempDir()
+	sessions := session.NewManager(t.TempDir())
+	msg := bus.InboundMessage{
+		Text:      "use a tool then force final streaming",
+		Channel:   "web",
+		AccountID: "acct-1",
+		ChatID:    "chat-stream-tool-cap",
+		UserID:    "owner-1",
+	}
+	sess := sessions.Get(msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
+	seedSessionForStreamingCompaction(sess)
+
+	const toolName = "stream_test_tool"
+	prov := &streamingEmergencyProvider{
+		firstChatTool:   toolName,
+		failFirstStream: true,
+		streamContent:   "STREAM_TOOL_FORCED_FINAL_RETRY_OK",
+	}
+	a := newStreamingCompactionTestAgent(t, home, sessions, prov, 1)
+	a.registry.Register(toolName, "return a deterministic test result", map[string]any{
+		"type":       "object",
+		"properties": map[string]any{},
+	}, func(context.Context, json.RawMessage) (string, error) {
+		return "TOOL_RESULT_FOR_STREAMING_CAP", nil
+	})
+
+	content := drainStream(t, a.HandleMessageStream(context.Background(), msg))
+
+	if !strings.Contains(content, "STREAM_TOOL_FORCED_FINAL_RETRY_OK") {
+		t.Fatalf("stream content = %q, want forced final retry content", content)
+	}
+	if prov.chatCalls != 1 {
+		t.Fatalf("chatCalls = %d, want one tool-iteration Chat", prov.chatCalls)
+	}
+	if prov.streamCalls != 2 {
+		t.Fatalf("streamCalls = %d, want 2", prov.streamCalls)
+	}
+	if len(prov.streamTools) != 2 || len(prov.streamTools[0]) != 0 || len(prov.streamTools[1]) != 0 {
+		t.Fatalf("forced final stream tools = %+v, want no tools on both attempts", prov.streamTools)
+	}
+	retryText := messagesText(prov.streamRequests[1])
+	if !strings.Contains(retryText, "[Reactive Context Summary]") {
+		t.Fatalf("retry stream request missing reactive summary:\n%s", retryText)
+	}
+	if !strings.Contains(retryText, "You've used all 1 tool-call iterations") {
+		t.Fatalf("retry stream request missing cap nudge:\n%s", retryText)
+	}
+	sessionText := messagesText(sess.GetMessages())
+	if !strings.Contains(sessionText, "TOOL_RESULT_FOR_STREAMING_CAP") {
+		t.Fatalf("session missing tool result:\n%s", sessionText)
+	}
+	if strings.Contains(sessionText, "You've used all 1 tool-call iterations") {
+		t.Fatalf("session messages included request-only cap nudge:\n%s", sessionText)
+	}
+}
+
+func TestHandleMessageStreamNoProviderReturnsMessageStream(t *testing.T) {
+	home := t.TempDir()
+	sessions := session.NewManager(t.TempDir())
+	msg := bus.InboundMessage{
+		Text:      "hello",
+		Channel:   "web",
+		AccountID: "acct-1",
+		ChatID:    "chat-stream-no-provider",
+		UserID:    "owner-1",
+	}
+	a := newStreamingCompactionTestAgent(t, home, sessions, nil, 1)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("HandleMessageStream panicked with nil provider: %v", r)
+		}
+	}()
+
+	content := drainStream(t, a.HandleMessageStream(context.Background(), msg))
+	want := "Agent is not configured with a usable LLM provider. Check that cfg.Providers contains the prefix referenced by model `fake-model`."
+	if content != want {
+		t.Fatalf("stream content = %q, want %q", content, want)
 	}
 }
 

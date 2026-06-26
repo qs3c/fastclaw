@@ -2845,6 +2845,12 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 		return a.stringStream(rejection)
 	}
 
+	if a.provider == nil {
+		slog.Error("agent has no provider configured", "agent", a.name, "model", a.model)
+		noProviderMsg := "Agent is not configured with a usable LLM provider. Check that cfg.Providers contains the prefix referenced by model `" + a.model + "`."
+		return a.stringStream(noProviderMsg)
+	}
+
 	chatterUID := a.chatterUserID(msg)
 	ctx = sandbox.WithUserID(ctx, chatterUID)
 	// Tag ctx so DBStore session writes stamp chatter_user_id — see
@@ -3069,7 +3075,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 					Content: "Loop detected: you called the same tool with the same arguments 3 times. Please try a different approach.",
 				}
 				sess.Append(warnMsg)
-				messages = append(messages, warnMsg)
+				messages = buildRequest(sess.GetMessages())
 				loopDetected = true
 				break
 			}
@@ -3104,6 +3110,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 			sess.Append(toolMsg)
 			messages = append(messages, toolMsg)
 		}
+		messages = buildRequest(sess.GetMessages())
 	}
 
 	slog.Warn("max tool iterations reached — streaming forced final delivery", "agent", a.name, "max", a.maxToolIterations)
