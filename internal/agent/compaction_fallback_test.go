@@ -56,6 +56,49 @@ func (f *forcedFinalRetryProvider) ChatStream(_ context.Context, messages []prov
 	return provider.NewStreamReader(ch), nil
 }
 
+type streamingEmergencyProvider struct {
+	failFirstChat   bool
+	failFirstStream bool
+	streamContent   string
+
+	chatCalls      int
+	chatRequests   [][]provider.Message
+	chatTools      [][]provider.Tool
+	summaryPrompts [][]provider.Message
+	streamCalls    int
+	streamRequests [][]provider.Message
+	streamTools    [][]provider.Tool
+}
+
+func (s *streamingEmergencyProvider) Chat(_ context.Context, messages []provider.Message, tools []provider.Tool, _ string, _ int, _ float64) (*provider.Response, error) {
+	if isSummaryPrompt(messages) {
+		s.summaryPrompts = append(s.summaryPrompts, append([]provider.Message(nil), messages...))
+		return &provider.Response{Content: "streaming emergency summary"}, nil
+	}
+
+	s.chatCalls++
+	s.chatRequests = append(s.chatRequests, append([]provider.Message(nil), messages...))
+	s.chatTools = append(s.chatTools, append([]provider.Tool(nil), tools...))
+	if s.failFirstChat && s.chatCalls == 1 {
+		return nil, errors.New("too many tokens")
+	}
+	return &provider.Response{Content: "non-stream final seed"}, nil
+}
+
+func (s *streamingEmergencyProvider) ChatStream(_ context.Context, messages []provider.Message, tools []provider.Tool, _ string, _ int, _ float64) (*provider.StreamReader, error) {
+	s.streamCalls++
+	s.streamRequests = append(s.streamRequests, append([]provider.Message(nil), messages...))
+	s.streamTools = append(s.streamTools, append([]provider.Tool(nil), tools...))
+	if s.failFirstStream && s.streamCalls == 1 {
+		return nil, errors.New("too many tokens")
+	}
+	content := s.streamContent
+	if content == "" {
+		content = "STREAM_OK"
+	}
+	return streamFromContent(content), nil
+}
+
 type recordingSummaryProvider struct {
 	prompts [][]provider.Message
 }
@@ -130,6 +173,141 @@ func TestLLMRetryRetriesTransientErrors(t *testing.T) {
 	}
 	if attempts != 2 {
 		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestHandleMessageStreamToolIterationEmergencyCompactsAndRetries(t *testing.T) {
+	home := t.TempDir()
+	sessions := session.NewManager(t.TempDir())
+	msg := bus.InboundMessage{
+		Text:      "new request from alice@example.com",
+		Channel:   "web",
+		AccountID: "acct-1",
+		ChatID:    "chat-stream-chat",
+		UserID:    "owner-1",
+	}
+	sess := sessions.Get(msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
+	seedSessionForStreamingCompaction(sess)
+
+	prov := &streamingEmergencyProvider{
+		failFirstChat: true,
+		streamContent: "STREAM_CHAT_RETRY_OK",
+	}
+	a := newStreamingCompactionTestAgent(t, home, sessions, prov, 1)
+	a.piiScrubEnabled = true
+
+	content := drainStream(t, a.HandleMessageStream(context.Background(), msg))
+
+	if !strings.Contains(content, "STREAM_CHAT_RETRY_OK") {
+		t.Fatalf("stream content = %q, want retry stream content", content)
+	}
+	if prov.chatCalls != 2 {
+		t.Fatalf("chatCalls = %d, want 2", prov.chatCalls)
+	}
+	retryText := messagesText(prov.chatRequests[1])
+	if !strings.Contains(retryText, "[Reactive Context Summary]") {
+		t.Fatalf("retry request missing reactive summary:\n%s", retryText)
+	}
+	for i, req := range prov.chatRequests {
+		text := messagesText(req)
+		if strings.Contains(text, "alice@example.com") {
+			t.Fatalf("chat request %d leaked raw email:\n%s", i+1, text)
+		}
+		if !strings.Contains(text, "[EMAIL]") {
+			t.Fatalf("chat request %d missing redacted email:\n%s", i+1, text)
+		}
+	}
+}
+
+func TestStreamFinalChatStreamEmergencyCompactsAndRetries(t *testing.T) {
+	home := t.TempDir()
+	sessions := session.NewManager(t.TempDir())
+	msg := bus.InboundMessage{
+		Text:      "stream this for alice@example.com",
+		Channel:   "web",
+		AccountID: "acct-1",
+		ChatID:    "chat-stream-final",
+		UserID:    "owner-1",
+	}
+	sess := sessions.Get(msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
+	seedSessionForStreamingCompaction(sess)
+
+	prov := &streamingEmergencyProvider{
+		failFirstStream: true,
+		streamContent:   "STREAM_FINAL_RETRY_OK",
+	}
+	a := newStreamingCompactionTestAgent(t, home, sessions, prov, 1)
+	a.piiScrubEnabled = true
+
+	content := drainStream(t, a.HandleMessageStream(context.Background(), msg))
+
+	if !strings.Contains(content, "STREAM_FINAL_RETRY_OK") {
+		t.Fatalf("stream content = %q, want retry stream content", content)
+	}
+	if prov.streamCalls != 2 {
+		t.Fatalf("streamCalls = %d, want 2", prov.streamCalls)
+	}
+	retryText := messagesText(prov.streamRequests[1])
+	if !strings.Contains(retryText, "[Reactive Context Summary]") {
+		t.Fatalf("retry stream request missing reactive summary:\n%s", retryText)
+	}
+	for i, req := range prov.streamRequests {
+		text := messagesText(req)
+		if strings.Contains(text, "alice@example.com") {
+			t.Fatalf("stream request %d leaked raw email:\n%s", i+1, text)
+		}
+		if !strings.Contains(text, "[EMAIL]") {
+			t.Fatalf("stream request %d missing redacted email:\n%s", i+1, text)
+		}
+	}
+	sessionText := messagesText(sess.GetMessages())
+	if !strings.Contains(sessionText, "STREAM_FINAL_RETRY_OK") {
+		t.Fatalf("session missing streamed assistant content:\n%s", sessionText)
+	}
+	if strings.Contains(sessionText, "non-stream final seed") {
+		t.Fatalf("session persisted fallback Chat content instead of stream content:\n%s", sessionText)
+	}
+}
+
+func TestForcedFinalDeliveryStreamUsesEmergencyRetryAndKeepsCapNudgeRequestOnly(t *testing.T) {
+	home := t.TempDir()
+	sessions := session.NewManager(t.TempDir())
+	msg := bus.InboundMessage{
+		Text:      "force final streaming",
+		Channel:   "web",
+		AccountID: "acct-1",
+		ChatID:    "chat-stream-cap",
+		UserID:    "owner-1",
+	}
+	sess := sessions.Get(msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
+	seedSessionForStreamingCompaction(sess)
+
+	prov := &streamingEmergencyProvider{
+		failFirstStream: true,
+		streamContent:   "STREAM_FORCED_FINAL_RETRY_OK",
+	}
+	a := newStreamingCompactionTestAgent(t, home, sessions, prov, 0)
+
+	content := drainStream(t, a.HandleMessageStream(context.Background(), msg))
+
+	if !strings.Contains(content, "STREAM_FORCED_FINAL_RETRY_OK") {
+		t.Fatalf("stream content = %q, want forced final retry content", content)
+	}
+	if prov.streamCalls != 2 {
+		t.Fatalf("streamCalls = %d, want 2", prov.streamCalls)
+	}
+	if len(prov.streamTools) != 2 || len(prov.streamTools[0]) != 0 || len(prov.streamTools[1]) != 0 {
+		t.Fatalf("forced final stream tools = %+v, want no tools on both attempts", prov.streamTools)
+	}
+	retryText := messagesText(prov.streamRequests[1])
+	if !strings.Contains(retryText, "[Reactive Context Summary]") {
+		t.Fatalf("retry stream request missing reactive summary:\n%s", retryText)
+	}
+	if !strings.Contains(retryText, "You've used all 0 tool-call iterations") {
+		t.Fatalf("retry stream request missing cap nudge:\n%s", retryText)
+	}
+	if strings.Contains(messagesText(sess.GetMessages()), "You've used all 0 tool-call iterations") {
+		t.Fatalf("session messages included request-only cap nudge:\n%s", messagesText(sess.GetMessages()))
 	}
 }
 
@@ -563,6 +741,69 @@ func timestampUserMessages(messages []provider.Message) []provider.Message {
 		}
 	}
 	return out
+}
+
+func seedSessionForStreamingCompaction(sess *session.Session) {
+	for i := 0; i < 12; i++ {
+		sess.Append(provider.Message{Role: "user", Content: strings.Repeat("old alice@example.com user ", 20), Origin: provider.OriginUser})
+		sess.Append(provider.Message{Role: "assistant", Content: strings.Repeat("old assistant ", 20), Origin: provider.OriginUser})
+	}
+	sess.Append(provider.Message{Role: "user", Content: "KEEP_RECENT_STREAMING_TURN", Origin: provider.OriginUser})
+}
+
+func newStreamingCompactionTestAgent(t *testing.T, home string, sessions *session.Manager, prov provider.Provider, maxToolIterations int) *Agent {
+	t.Helper()
+	reg := tools.NewRegistry(home, home)
+	t.Cleanup(reg.Close)
+	mem := NewMemory(home)
+	return &Agent{
+		name:              "agent-test",
+		provider:          prov,
+		registry:          reg,
+		sessions:          sessions,
+		memory:            mem,
+		ctxBuilder:        NewContextBuilder(home, mem, ""),
+		hooks:             NewHookRegistry(),
+		model:             "fake-model",
+		maxTokens:         20,
+		maxToolIterations: maxToolIterations,
+		contextWindow:     120,
+		homePath:          home,
+		homeDir:           home,
+		workspacePath:     home,
+		ownerUserID:       "owner-1",
+		engine:            newSDKEngine("test-session"),
+	}
+}
+
+func isSummaryPrompt(messages []provider.Message) bool {
+	if len(messages) != 2 {
+		return false
+	}
+	return strings.Contains(messages[0].Content, "conversation summarizer")
+}
+
+func streamFromContent(content string) *provider.StreamReader {
+	ch := make(chan provider.StreamChunk, 1)
+	ch <- provider.StreamChunk{Content: content, Done: true}
+	close(ch)
+	return provider.NewStreamReader(ch)
+}
+
+func drainStream(t *testing.T, sr *provider.StreamReader) string {
+	t.Helper()
+	var b strings.Builder
+	for {
+		chunk, ok := sr.Next()
+		if !ok {
+			break
+		}
+		b.WriteString(chunk.Content)
+	}
+	if err := sr.Err(); err != nil {
+		t.Fatalf("stream error: %v", err)
+	}
+	return b.String()
 }
 
 func messagesText(messages []provider.Message) string {

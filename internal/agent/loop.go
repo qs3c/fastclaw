@@ -784,6 +784,7 @@ func (a *Agent) compactWithProgress(ctx context.Context, sessionMsgs []provider.
 }
 
 type modelCallFunc func(request []provider.Message, tools []provider.Tool) (*provider.Response, error)
+type modelStreamCallFunc func(request []provider.Message, tools []provider.Tool) (*provider.StreamReader, error)
 type modelRequestBuildFunc func(sessionMessages []provider.Message) []provider.Message
 type modelRequestPrepareFunc func([]provider.Message) []provider.Message
 
@@ -858,6 +859,46 @@ func (a *Agent) callLLMWithEmergencyRetry(
 	retryRequest = prepareModelRequest(retryRequest, prepare)
 	retryResp, retryErr := call(retryRequest, callTools)
 	return retryResp, rebuiltCanonical, true, retryErr
+}
+
+func (a *Agent) chatStreamWithEmergencyRetry(
+	ctx context.Context,
+	sess *session.Session,
+	overhead []provider.Message,
+	toolDefs []provider.Tool,
+	messages []provider.Message,
+	callTools []provider.Tool,
+	alreadyRetried bool,
+	buildRequest modelRequestBuildFunc,
+	prepare modelRequestPrepareFunc,
+	call modelStreamCallFunc,
+) (*provider.StreamReader, []provider.Message, bool, error) {
+	baseRequest := buildModelRequest(sess.GetMessages(), overhead, buildRequest)
+	suffix := requestOnlySuffix(messages, baseRequest)
+	request := prepareModelRequest(messages, prepare)
+	sr, err := call(request, callTools)
+	if err == nil || alreadyRetried || !isContextLimitError(err) {
+		return sr, messages, false, err
+	}
+
+	result, compactErr := a.compactWithProgress(ctx, sess.GetMessages(), a.compactionOptions(CompactModeEmergency, overhead, toolDefs, sess.SessionKey(), buildRequest))
+	if compactErr != nil {
+		slog.Warn("emergency stream compaction failed", "agent", a.name, "error", compactErr)
+		return sr, messages, false, err
+	}
+	if result == nil || !result.Pruned {
+		return sr, messages, false, err
+	}
+
+	sess.ReplaceMessages(result.Messages)
+	rebuiltCanonical := buildModelRequest(result.Messages, overhead, buildRequest)
+	retryRequest := rebuiltCanonical
+	if len(suffix) > 0 {
+		retryRequest = append(append([]provider.Message(nil), rebuiltCanonical...), suffix...)
+	}
+	retryRequest = prepareModelRequest(retryRequest, prepare)
+	retrySR, retryErr := call(retryRequest, callTools)
+	return retrySR, rebuiltCanonical, true, retryErr
 }
 
 func (a *Agent) buildRequestOverhead(systemPrompt string, msg bus.InboundMessage, chatterMem *Memory) []provider.Message {
@@ -2852,8 +2893,14 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	userMsg := buildUserMessage(msg)
 	sess.Append(userMsg)
 
+	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
+	overheadMessages := a.buildRequestOverhead(systemPrompt, msg, chatterMem)
+	buildRequest := func(sessionMessages []provider.Message) []provider.Message {
+		return compactionRequestMessages(a.withMessageTimestampsForChatter(sessionMessages, chatterUID), overheadMessages)
+	}
+
 	sessionMsgs := sess.GetMessages()
-	compactResult, err := CompactMessages(sessionMsgs, a.homePath, a.provider, a.model)
+	compactResult, err := a.compactWithProgress(ctx, sessionMsgs, a.compactionOptions(CompactModeProactive, overheadMessages, toolDefs, sess.SessionKey(), buildRequest))
 	if err != nil {
 		slog.Warn("compaction error", "agent", a.name, "error", err)
 	}
@@ -2862,23 +2909,8 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 		sessionMsgs = compactResult.Messages
 	}
 
-	messages := make([]provider.Message, 0, len(sessionMsgs)+4)
-	messages = append(messages, provider.Message{Role: "system", Content: systemPrompt})
-	if hints := renderChannelHints(msg, a.splitReplies); hints != "" {
-		messages = append(messages, provider.Message{Role: "system", Content: hints})
-	}
-	if senderMsg := renderSender(msg); senderMsg != "" {
-		messages = append(messages, provider.Message{Role: "system", Content: senderMsg})
-	}
-	if paramsMsg := renderClientParams(msg.Params); paramsMsg != "" {
-		messages = append(messages, provider.Message{Role: "system", Content: paramsMsg})
-	}
-	if reminder := renderChatbotPersistenceReminder(a.promptMode, a.displayName, chatterMem.LoadUserFile(), chatterMem.LoadMemory()); reminder != "" {
-		messages = append(messages, provider.Message{Role: "system", Content: reminder})
-	}
-	messages = append(messages, a.withMessageTimestampsForChatter(sessionMsgs, chatterUID)...)
-
-	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
+	messages := buildRequest(sessionMsgs)
+	prepareOutbound := a.prepareOutboundMessages
 
 	type toolCallSig struct {
 		name string
@@ -2887,16 +2919,23 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	var lastSig toolCallSig
 	consecutiveCount := 0
 	totalToolCalls := 0
+	emergencyRetried := false
 
 	// ReAct loop - use Chat for tool iterations
 	for i := 0; i < a.maxToolIterations; i++ {
 		hcBefore := &HookContext{AgentName: a.name, Point: BeforeModelCall, Messages: messages, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID}
 		a.hooks.Run(ctx, hcBefore)
 
-		dumpLLMRequest(a.name, a.model, messages, toolDefs)
-		resp, err := llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
-			return a.provider.Chat(ctx, messages, toolDefs, a.model, a.maxTokens, a.temperature)
+		resp, updatedMessages, didRetry, err := a.callLLMWithEmergencyRetry(ctx, sess, overheadMessages, toolDefs, messages, toolDefs, emergencyRetried, buildRequest, prepareOutbound, func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
+			dumpLLMRequest(a.name, a.model, request, tools)
+			return llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
+				return a.provider.Chat(ctx, request, tools, a.model, a.maxTokens, a.temperature)
+			})
 		})
+		if didRetry {
+			emergencyRetried = true
+			messages = updatedMessages
+		}
 
 		hcAfter := &HookContext{AgentName: a.name, Point: AfterModelCall, Messages: messages, Response: resp, Error: err, StartTime: hcBefore.StartTime, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID, GoalSessionKey: a.registry.GoalSessionKey()}
 		a.hooks.Run(ctx, hcAfter)
@@ -2910,7 +2949,13 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 
 		if !resp.HasToolCalls() {
 			// Final response - use streaming
-			sr, err := a.provider.ChatStream(ctx, messages, toolDefs, a.model, a.maxTokens, a.temperature)
+			sr, updatedMessages, didRetry, err := a.chatStreamWithEmergencyRetry(ctx, sess, overheadMessages, toolDefs, messages, toolDefs, emergencyRetried, buildRequest, prepareOutbound, func(request []provider.Message, tools []provider.Tool) (*provider.StreamReader, error) {
+				return a.provider.ChatStream(ctx, request, tools, a.model, a.maxTokens, a.temperature)
+			})
+			if didRetry {
+				emergencyRetried = true
+				messages = updatedMessages
+			}
 			if err != nil {
 				slog.Error("LLM stream failed, falling back", "agent", a.name, "error", err)
 				sess.Append(provider.Message{Role: "assistant", Content: resp.Content})
@@ -3062,7 +3107,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	}
 
 	slog.Warn("max tool iterations reached — streaming forced final delivery", "agent", a.name, "max", a.maxToolIterations)
-	return a.streamFinalDeliveryAfterCap(ctx, msg, messages, sess, totalToolCalls, chatterMem)
+	return a.streamFinalDeliveryAfterCap(ctx, msg, messages, sess, totalToolCalls, chatterMem, overheadMessages, toolDefs, emergencyRetried, buildRequest, prepareOutbound)
 }
 
 // streamFinalDeliveryAfterCap runs one extra ChatStream with tools
@@ -3070,10 +3115,15 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 // with iteration-cap metadata so the chat UI can badge the bubble.
 // Returned StreamReader matches the contract of the normal "final
 // response" branch above so callers don't need a special case.
-func (a *Agent) streamFinalDeliveryAfterCap(ctx context.Context, inboundMsg bus.InboundMessage, messages []provider.Message, sess *session.Session, toolCallCount int, chatterMem *Memory) *provider.StreamReader {
+func (a *Agent) streamFinalDeliveryAfterCap(ctx context.Context, inboundMsg bus.InboundMessage, messages []provider.Message, sess *session.Session, toolCallCount int, chatterMem *Memory, overheadMessages []provider.Message, toolDefs []provider.Tool, emergencyRetried bool, buildRequest modelRequestBuildFunc, prepareOutbound modelRequestPrepareFunc) *provider.StreamReader {
 	capMeta := iterationCapMetadata(a.maxToolIterations)
-	finalMessages := append(messages, capReachedNudge(a.maxToolIterations))
-	sr, err := a.provider.ChatStream(ctx, finalMessages, nil, a.model, a.maxTokens, a.temperature)
+	finalMessages := append(append([]provider.Message(nil), messages...), capReachedNudge(a.maxToolIterations))
+	sr, updatedMessages, didRetry, err := a.chatStreamWithEmergencyRetry(ctx, sess, overheadMessages, toolDefs, finalMessages, nil, emergencyRetried, buildRequest, prepareOutbound, func(request []provider.Message, tools []provider.Tool) (*provider.StreamReader, error) {
+		return a.provider.ChatStream(ctx, request, tools, a.model, a.maxTokens, a.temperature)
+	})
+	if didRetry {
+		messages = updatedMessages
+	}
 	if err != nil {
 		// Streaming endpoint failed — persist+emit a fallback line
 		// with the badge so the user still gets the signal.
