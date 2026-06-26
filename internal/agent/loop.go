@@ -43,6 +43,7 @@ type Agent struct {
 	hooks                *HookRegistry
 	model                string
 	maxTokens            int
+	contextWindow        int
 	temperature          float64
 	maxToolIterations    int
 	maxParallelToolCalls int // 0 = unlimited
@@ -725,6 +726,66 @@ func (a *Agent) streamChatToResponse(ctx context.Context, messages []provider.Me
 
 func (a *Agent) streamChatToResponseQuiet(ctx context.Context, messages []provider.Message, tools []provider.Tool) (*provider.Response, error) {
 	return a.streamChatToResponseWithOptions(ctx, messages, tools, false)
+}
+
+func (a *Agent) compactionOptions(mode CompactMode, overhead []provider.Message, toolDefs []provider.Tool, sessionKey string) CompactOptions {
+	_ = sessionKey
+	contextWindow := a.contextWindow
+	if contextWindow <= 0 {
+		contextWindow = DefaultContextWindow
+	}
+	return CompactOptions{
+		Mode:              mode,
+		Workspace:         a.homePath,
+		Provider:          a.provider,
+		Model:             a.model,
+		ContextWindow:     contextWindow,
+		MaxOutputTokens:   a.maxTokens,
+		OverheadMessages:  overhead,
+		ToolDefs:          toolDefs,
+		SummaryMaxRetries: DefaultSummaryMaxRetries,
+	}
+}
+
+func (a *Agent) compactWithProgress(ctx context.Context, sessionMsgs []provider.Message, opts CompactOptions) (*CompactResult, error) {
+	emitEvent(ctx, ChatEvent{Type: "compaction", Data: map[string]any{"active": true}})
+	defer emitEvent(ctx, ChatEvent{Type: "compaction", Data: map[string]any{"active": false}})
+	if opts.Ctx == nil {
+		opts.Ctx = ctx
+	}
+	return CompactMessagesWithOptions(sessionMsgs, opts)
+}
+
+type modelCallFunc func(request []provider.Message, tools []provider.Tool) (*provider.Response, error)
+
+func (a *Agent) callLLMWithEmergencyRetry(
+	ctx context.Context,
+	sess *session.Session,
+	overhead []provider.Message,
+	toolDefs []provider.Tool,
+	messages []provider.Message,
+	callTools []provider.Tool,
+	alreadyRetried bool,
+	call modelCallFunc,
+) (*provider.Response, []provider.Message, bool, error) {
+	resp, err := call(messages, callTools)
+	if err == nil || alreadyRetried || !isContextLimitError(err) {
+		return resp, messages, alreadyRetried, err
+	}
+
+	result, compactErr := a.compactWithProgress(ctx, sess.GetMessages(), a.compactionOptions(CompactModeEmergency, overhead, toolDefs, sess.SessionKey()))
+	if compactErr != nil {
+		slog.Warn("emergency compaction failed", "agent", a.name, "error", compactErr)
+		return resp, messages, alreadyRetried, err
+	}
+	if result == nil || !result.Pruned {
+		return resp, messages, alreadyRetried, err
+	}
+
+	sess.ReplaceMessages(result.Messages)
+	rebuilt := compactionRequestMessages(result.Messages, overhead)
+	retryResp, retryErr := call(rebuilt, callTools)
+	return retryResp, rebuilt, true, retryErr
 }
 
 func (a *Agent) streamChatToResponseWithOptions(ctx context.Context, messages []provider.Message, tools []provider.Tool, emitDeltas bool) (*provider.Response, error) {

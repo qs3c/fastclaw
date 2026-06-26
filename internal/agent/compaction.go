@@ -215,6 +215,7 @@ func compactionRequestMessages(messages, overhead []provider.Message) []provider
 }
 
 func emergencyCompactMessages(messages []provider.Message, opts CompactOptions, beforeTokens int) *CompactResult {
+	opts.Mode = CompactModeEmergency
 	slog.Info(
 		"emergency context compaction triggered",
 		"tokens", beforeTokens,
@@ -244,6 +245,7 @@ func emergencyCompactMessages(messages []provider.Message, opts CompactOptions, 
 		return &CompactResult{Messages: pruned, Pruned: changed, LogFile: logFile}
 	}
 	compressed, _ = sanitizeToolPairsWithChange(compressed)
+	changed = changed || !messagesEqual(pruned, compressed)
 
 	slog.Info(
 		"after emergency compression",
@@ -252,7 +254,7 @@ func emergencyCompactMessages(messages []provider.Message, opts CompactOptions, 
 	)
 	return &CompactResult{
 		Messages: compressed,
-		Pruned:   true,
+		Pruned:   changed,
 		LogFile:  logFile,
 	}
 }
@@ -523,7 +525,8 @@ func compressOlderMessages(messages []provider.Message, opts CompactOptions) ([]
 
 	summary, err := summarizeWithRetries(opts, summaryPrompt)
 	if err != nil {
-		return nil, err
+		slog.Warn("compression summary failed after retries, using deterministic fallback", "error", err)
+		summary = deterministicSummaryFallback(olderMessages)
 	}
 
 	compressed := make([]provider.Message, 0, len(messages)-cutoff+1)
@@ -536,6 +539,47 @@ func compressOlderMessages(messages []provider.Message, opts CompactOptions) ([]
 	return compressed, nil
 }
 
+func isContextLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if isRateLimitLikeError(msg) {
+		return false
+	}
+	for _, marker := range []string{
+		"context_length_exceeded",
+		"maximum context length",
+		"prompt too long",
+		"prompt is too long",
+		"too many tokens",
+		"too many tokens in request",
+		"input length exceeds context window",
+		"request too large",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isRateLimitLikeError(msg string) bool {
+	for _, marker := range []string{
+		"rate limit",
+		"rate_limit",
+		"tokens per minute",
+		"requests per minute",
+		"quota",
+		"throttle",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func summarizeWithRetries(opts CompactOptions, prompt []provider.Message) (string, error) {
 	if opts.Provider == nil {
 		return "", fmt.Errorf("summarize conversation: provider is nil")
@@ -546,17 +590,84 @@ func summarizeWithRetries(opts CompactOptions, prompt []provider.Message) (strin
 		ctx = context.Background()
 	}
 
-	resp, err := opts.Provider.Chat(ctx, prompt, nil, opts.Model, 2048, 0.3)
-	if err != nil {
-		return "", fmt.Errorf("summarize conversation: %w", err)
+	var lastErr error
+	for attempt := 0; attempt < opts.SummaryMaxRetries; attempt++ {
+		resp, err := opts.Provider.Chat(ctx, prompt, nil, opts.Model, 2048, 0.3)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp == nil {
+			lastErr = fmt.Errorf("response is nil")
+			continue
+		}
+		if strings.TrimSpace(resp.Content) == "" {
+			lastErr = fmt.Errorf("response content is empty")
+			continue
+		}
+		return resp.Content, nil
 	}
-	if resp == nil {
-		return "", fmt.Errorf("summarize conversation: response is nil")
+	return "", fmt.Errorf("summarize conversation: %w", lastErr)
+}
+
+func deterministicSummaryFallback(messages []provider.Message) string {
+	var b strings.Builder
+	marker := "deterministic fallback: LLM summary failed after retries. Older messages were compacted without an LLM."
+	b.WriteString(marker)
+	totalRunes := len([]rune(marker))
+	for _, msg := range messages {
+		if msg.Origin != provider.OriginUser {
+			continue
+		}
+		snippet := snippetForFallback(msg.TextContent(), fallbackSnippetMaxRunes)
+		if snippet == "" {
+			continue
+		}
+		next := fmt.Sprintf("\n[%s] %s", msg.Role, snippet)
+		nextRunes := len([]rune(next))
+		if totalRunes+nextRunes > fallbackSummaryMaxRunes {
+			remaining := fallbackSummaryMaxRunes - totalRunes
+			if remaining > 0 {
+				b.WriteString(snippetForFallback(next, remaining))
+			}
+			break
+		}
+		b.WriteString(next)
+		totalRunes += nextRunes
 	}
-	if strings.TrimSpace(resp.Content) == "" {
-		return "", fmt.Errorf("summarize conversation: response content is empty")
+	return b.String()
+}
+
+func snippetForFallback(text string, maxRunes int) string {
+	text = strings.Join(strings.Fields(text), " ")
+	if maxRunes <= 0 || text == "" {
+		return ""
 	}
-	return resp.Content, nil
+	runes := []rune(text)
+	if len(runes) <= maxRunes {
+		return text
+	}
+	if maxRunes <= 3 {
+		return string(runes[:maxRunes])
+	}
+	return string(runes[:maxRunes-3]) + "..."
+}
+
+func messagesEqual(a, b []provider.Message) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Role != b[i].Role ||
+			a[i].Content != b[i].Content ||
+			a[i].TextContent() != b[i].TextContent() ||
+			a[i].Origin != b[i].Origin ||
+			a[i].ToolCallID != b[i].ToolCallID ||
+			len(a[i].ToolCalls) != len(b[i].ToolCalls) {
+			return false
+		}
+	}
+	return true
 }
 
 // writeHistoryLog writes the full message history to a JSONL log file.
