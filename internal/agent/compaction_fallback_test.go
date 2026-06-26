@@ -215,6 +215,71 @@ func TestEmergencyRetryPreparesRetryRequest(t *testing.T) {
 	}
 }
 
+func TestEmergencyRetryPreservesRequestOnlySuffix(t *testing.T) {
+	mgr := session.NewManager(t.TempDir())
+	sess := mgr.Get("web", "", "chat", "")
+	sess.Append(provider.Message{Role: "user", Content: strings.Repeat("old user ", 40), Origin: provider.OriginUser})
+	sess.Append(provider.Message{Role: "assistant", Content: strings.Repeat("old assistant ", 40), Origin: provider.OriginUser})
+	sess.Append(provider.Message{Role: "user", Content: "KEEP_RECENT_USER_TURN", Origin: provider.OriginUser})
+
+	a := &Agent{
+		homePath:      t.TempDir(),
+		model:         "fake-model",
+		contextWindow: 120,
+		maxTokens:     20,
+	}
+	overhead := []provider.Message{{Role: "system", Content: strings.Repeat("overhead ", 5)}}
+	base := compactionRequestMessages(sess.GetMessages(), overhead)
+	messages := append(append([]provider.Message(nil), base...), provider.Message{
+		Role:    "system",
+		Content: "TRANSIENT_NO_TOOLS_NUDGE",
+	})
+
+	attempts := 0
+	resp, rebuilt, retried, err := a.callLLMWithEmergencyRetry(
+		context.Background(),
+		sess,
+		overhead,
+		nil,
+		messages,
+		nil,
+		false,
+		nil,
+		func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
+			attempts++
+			if attempts == 1 {
+				return nil, errors.New("too many tokens")
+			}
+			text := messagesText(request)
+			if !strings.Contains(text, "[Reactive Context Summary]") {
+				t.Fatalf("retry request missing reactive summary:\n%s", text)
+			}
+			if !strings.Contains(text, "KEEP_RECENT_USER_TURN") {
+				t.Fatalf("retry request missing recent user turn:\n%s", text)
+			}
+			if !strings.Contains(text, "TRANSIENT_NO_TOOLS_NUDGE") {
+				t.Fatalf("retry request missing request-only suffix:\n%s", text)
+			}
+			return &provider.Response{Content: "ok"}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("callLLMWithEmergencyRetry: %v", err)
+	}
+	if resp == nil || resp.Content != "ok" {
+		t.Fatalf("response = %+v, want ok", resp)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if !retried {
+		t.Fatal("retried = false, want true")
+	}
+	if !strings.Contains(messagesText(rebuilt), "TRANSIENT_NO_TOOLS_NUDGE") {
+		t.Fatalf("rebuilt messages missing request-only suffix:\n%s", messagesText(rebuilt))
+	}
+}
+
 func longConversation() []provider.Message {
 	var msgs []provider.Message
 	for i := 0; i < 12; i++ {

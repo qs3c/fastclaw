@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"reflect"
 	"strings"
 	"time"
 
@@ -786,6 +787,18 @@ func prepareModelRequest(messages []provider.Message, prepare modelRequestPrepar
 	return prepare(messages)
 }
 
+func requestOnlySuffix(messages []provider.Message, base []provider.Message) []provider.Message {
+	if len(messages) <= len(base) {
+		return nil
+	}
+	for i := range base {
+		if !reflect.DeepEqual(messages[i], base[i]) {
+			return nil
+		}
+	}
+	return append([]provider.Message(nil), messages[len(base):]...)
+}
+
 func (a *Agent) callLLMWithEmergencyRetry(
 	ctx context.Context,
 	sess *session.Session,
@@ -797,6 +810,8 @@ func (a *Agent) callLLMWithEmergencyRetry(
 	prepare modelRequestPrepareFunc,
 	call modelCallFunc,
 ) (*provider.Response, []provider.Message, bool, error) {
+	baseRequest := compactionRequestMessages(sess.GetMessages(), overhead)
+	suffix := requestOnlySuffix(messages, baseRequest)
 	request := prepareModelRequest(messages, prepare)
 	resp, err := call(request, callTools)
 	if err == nil || alreadyRetried || !isContextLimitError(err) {
@@ -814,6 +829,9 @@ func (a *Agent) callLLMWithEmergencyRetry(
 
 	sess.ReplaceMessages(result.Messages)
 	rebuilt := compactionRequestMessages(result.Messages, overhead)
+	if len(suffix) > 0 {
+		rebuilt = append(rebuilt, suffix...)
+	}
 	retryRequest := prepareModelRequest(rebuilt, prepare)
 	retryResp, retryErr := call(retryRequest, callTools)
 	return retryResp, rebuilt, true, retryErr
