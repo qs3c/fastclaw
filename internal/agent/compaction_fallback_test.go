@@ -117,6 +117,7 @@ func TestEmergencyRetryRetriesWithinSameIteration(t *testing.T) {
 		nil,
 		false,
 		nil,
+		nil,
 		func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
 			attempts++
 			if attempts == 1 {
@@ -175,6 +176,7 @@ func TestEmergencyRetryPreparesRetryRequest(t *testing.T) {
 		messages,
 		nil,
 		false,
+		nil,
 		redactSecretToken,
 		func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
 			attempts++
@@ -229,7 +231,10 @@ func TestEmergencyRetryPreservesRequestOnlySuffix(t *testing.T) {
 		maxTokens:     20,
 	}
 	overhead := []provider.Message{{Role: "system", Content: strings.Repeat("overhead ", 5)}}
-	base := compactionRequestMessages(sess.GetMessages(), overhead)
+	buildRequest := func(sessionMessages []provider.Message) []provider.Message {
+		return compactionRequestMessages(timestampUserMessages(sessionMessages), overhead)
+	}
+	base := buildRequest(sess.GetMessages())
 	messages := append(append([]provider.Message(nil), base...), provider.Message{
 		Role:    "system",
 		Content: "TRANSIENT_NO_TOOLS_NUDGE",
@@ -244,6 +249,7 @@ func TestEmergencyRetryPreservesRequestOnlySuffix(t *testing.T) {
 		messages,
 		nil,
 		false,
+		buildRequest,
 		nil,
 		func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
 			attempts++
@@ -275,8 +281,8 @@ func TestEmergencyRetryPreservesRequestOnlySuffix(t *testing.T) {
 	if !retried {
 		t.Fatal("retried = false, want true")
 	}
-	if !strings.Contains(messagesText(rebuilt), "TRANSIENT_NO_TOOLS_NUDGE") {
-		t.Fatalf("rebuilt messages missing request-only suffix:\n%s", messagesText(rebuilt))
+	if strings.Contains(messagesText(rebuilt), "TRANSIENT_NO_TOOLS_NUDGE") {
+		t.Fatalf("rebuilt canonical messages included request-only suffix:\n%s", messagesText(rebuilt))
 	}
 }
 
@@ -297,6 +303,17 @@ func redactSecretToken(messages []provider.Message) []provider.Message {
 	copy(out, messages)
 	for i := range out {
 		out[i].Content = strings.ReplaceAll(out[i].Content, "SECRET_TOKEN", "[REDACTED]")
+	}
+	return out
+}
+
+func timestampUserMessages(messages []provider.Message) []provider.Message {
+	out := make([]provider.Message, len(messages))
+	copy(out, messages)
+	for i := range out {
+		if out[i].Role == "user" {
+			out[i].Content = "TIMESTAMPED: " + out[i].Content
+		}
 	}
 	return out
 }

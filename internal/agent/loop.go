@@ -778,7 +778,15 @@ func (a *Agent) compactWithProgress(ctx context.Context, sessionMsgs []provider.
 }
 
 type modelCallFunc func(request []provider.Message, tools []provider.Tool) (*provider.Response, error)
+type modelRequestBuildFunc func(sessionMessages []provider.Message) []provider.Message
 type modelRequestPrepareFunc func([]provider.Message) []provider.Message
+
+func buildModelRequest(sessionMessages []provider.Message, overhead []provider.Message, build modelRequestBuildFunc) []provider.Message {
+	if build != nil {
+		return build(sessionMessages)
+	}
+	return compactionRequestMessages(sessionMessages, overhead)
+}
 
 func prepareModelRequest(messages []provider.Message, prepare modelRequestPrepareFunc) []provider.Message {
 	if prepare == nil {
@@ -807,10 +815,11 @@ func (a *Agent) callLLMWithEmergencyRetry(
 	messages []provider.Message,
 	callTools []provider.Tool,
 	alreadyRetried bool,
+	buildRequest modelRequestBuildFunc,
 	prepare modelRequestPrepareFunc,
 	call modelCallFunc,
 ) (*provider.Response, []provider.Message, bool, error) {
-	baseRequest := compactionRequestMessages(sess.GetMessages(), overhead)
+	baseRequest := buildModelRequest(sess.GetMessages(), overhead, buildRequest)
 	suffix := requestOnlySuffix(messages, baseRequest)
 	request := prepareModelRequest(messages, prepare)
 	resp, err := call(request, callTools)
@@ -828,13 +837,14 @@ func (a *Agent) callLLMWithEmergencyRetry(
 	}
 
 	sess.ReplaceMessages(result.Messages)
-	rebuilt := compactionRequestMessages(result.Messages, overhead)
+	rebuiltCanonical := buildModelRequest(result.Messages, overhead, buildRequest)
+	retryRequest := rebuiltCanonical
 	if len(suffix) > 0 {
-		rebuilt = append(rebuilt, suffix...)
+		retryRequest = append(append([]provider.Message(nil), rebuiltCanonical...), suffix...)
 	}
-	retryRequest := prepareModelRequest(rebuilt, prepare)
+	retryRequest = prepareModelRequest(retryRequest, prepare)
 	retryResp, retryErr := call(retryRequest, callTools)
-	return retryResp, rebuilt, true, retryErr
+	return retryResp, rebuiltCanonical, true, retryErr
 }
 
 func (a *Agent) buildRequestOverhead(systemPrompt string, msg bus.InboundMessage, chatterMem *Memory) []provider.Message {
@@ -2118,7 +2128,10 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		slog.Info("context compacted", "agent", a.name, "log_file", compactResult.LogFile)
 	}
 
-	messages := compactionRequestMessages(a.withMessageTimestampsForChatter(sessionMsgs, chatterUID), overheadMessages)
+	buildRequest := func(sessionMessages []provider.Message) []provider.Message {
+		return compactionRequestMessages(a.withMessageTimestampsForChatter(sessionMessages, chatterUID), overheadMessages)
+	}
+	messages := buildRequest(sessionMsgs)
 	// Loop detection: track consecutive identical tool calls
 	type toolCallSig struct {
 		name string
@@ -2194,7 +2207,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				),
 			})
 		}
-		resp, updatedMessages, didRetry, err := a.callLLMWithEmergencyRetry(ctx, sess, overheadMessages, toolDefs, llmMessages, callTools, emergencyRetried, prepareModelRequest, func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
+		resp, updatedMessages, didRetry, err := a.callLLMWithEmergencyRetry(ctx, sess, overheadMessages, toolDefs, llmMessages, callTools, emergencyRetried, buildRequest, prepareModelRequest, func(request []provider.Message, tools []provider.Tool) (*provider.Response, error) {
 			dumpLLMRequest(a.name, a.model, request, tools)
 			return llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
 				return a.streamChatToResponse(ctx, request, tools)
