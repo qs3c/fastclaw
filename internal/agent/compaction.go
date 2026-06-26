@@ -589,21 +589,3 @@ func writeHistoryLog(messages []provider.Message, workspace string) (string, err
 	slog.Info("wrote history log", "file", logFile, "messages", len(messages))
 	return logFile, nil
 }
-
-func sanitizeToolPairsWithChange(messages []provider.Message) ([]provider.Message, bool) {
-	return messages, false
-}
-
-type toolCallInfo struct {
-	Name string
-}
-
-func buildToolResultInfoByIndex(messages []provider.Message) map[int]toolCallInfo {
-	return map[int]toolCallInfo{}
-}
-
-func summarizeToolResultWithInfo(msg provider.Message, _ toolCallInfo) provider.Message {
-	msg.Content = "[Tool Result Summary]\noutput_chars: " + fmt.Sprint(len([]rune(msg.Content)))
-	msg.Metadata = nil
-	return msg
-}
